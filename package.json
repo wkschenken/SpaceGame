@@ -1,0 +1,18 @@
+{
+  "name": "space-race-game",
+  "version": "1.0.0",
+  "description": "A Phaser 3 space racing game with relativistic time mechanics",
+  "main": "index.js",
+  "scripts": {
+    "start": "npx http-server -p 8080 -o"
+  },
+  "keywords": ["phaser", "game", "space"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "phaser": "^3.60.0"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}

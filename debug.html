@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Debug - Space Race</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #000;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+        }
+        #status {
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #111;
+            border: 2px solid #0f0;
+        }
+        #game-container {
+            border: 2px solid #00f;
+            display: inline-block;
+        }
+        .step {
+            padding: 5px;
+            margin: 5px 0;
+        }
+        .success { color: #0f0; }
+        .error { color: #f00; }
+        .pending { color: #ff0; }
+    </style>
+</head>
+<body>
+    <div id="status">
+        <h2>Loading Diagnostics</h2>
+        <div id="step1" class="step pending">1. Loading page...</div>
+        <div id="step2" class="step pending">2. Loading Phaser library...</div>
+        <div id="step3" class="step pending">3. Creating game configuration...</div>
+        <div id="step4" class="step pending">4. Initializing Phaser game...</div>
+        <div id="step5" class="step pending">5. Loading game scene...</div>
+        <div id="errors" style="color: #f00; margin-top: 10px;"></div>
+    </div>
+    <div id="game-container"></div>
+    
+    <script>
+        // Capture all errors
+        window.onerror = function(msg, url, line, col, error) {
+            document.getElementById('errors').innerHTML += `<br>ERROR: ${msg} at line ${line}:${col}`;
+            console.error('Error:', msg, error);
+            return false;
+        };
+        
+        console.log('Page loaded');
+        document.getElementById('step1').className = 'step success';
+        document.getElementById('step1').textContent = '1. ✓ Page loaded';
+    </script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+    
+    <script>
+        console.log('Checking Phaser...');
+        if (typeof Phaser !== 'undefined') {
+            console.log('Phaser loaded successfully, version:', Phaser.VERSION);
+            document.getElementById('step2').className = 'step success';
+            document.getElementById('step2').textContent = '2. ✓ Phaser loaded (v' + Phaser.VERSION + ')';
+            
+            try {
+                console.log('Creating game config...');
+                document.getElementById('step3').className = 'step success';
+                document.getElementById('step3').textContent = '3. ✓ Creating game configuration...';
+                
+                class TestScene extends Phaser.Scene {
+                    constructor() {
+                        super({ key: 'TestScene' });
+                    }
+                    
+                    preload() {
+                        console.log('TestScene: preload called');
+                    }
+                    
+                    create() {
+                        console.log('TestScene: create called');
+                        document.getElementById('step5').className = 'step success';
+                        document.getElementById('step5').textContent = '5. ✓ Game scene created!';
+                        
+                        // Add visible test elements
+                        this.add.text(400, 300, 'GAME IS WORKING!', {
+                            fontSize: '48px',
+                            fill: '#00ff00'
+                        }).setOrigin(0.5);
+                        
+                        this.add.circle(400, 400, 50, 0xff0000);
+                        this.add.circle(500, 400, 50, 0x00ff00);
+                        this.add.circle(600, 400, 50, 0x0000ff);
+                        
+                        this.add.text(400, 500, 'If you see this, Phaser is working!\nPress any key to continue...', {
+                            fontSize: '20px',
+                            fill: '#ffffff',
+                            align: 'center'
+                        }).setOrigin(0.5);
+                        
+                        this.input.keyboard.once('keydown', () => {
+                            console.log('Key pressed, loading main game...');
+                            this.scene.start('GameScene');
+                        });
+                    }
+                }
+                
+                class GameScene extends Phaser.Scene {
+                    constructor() {
+                        super({ key: 'GameScene' });
+                    }
+                    
+                    create() {
+                        console.log('GameScene: Starting...');
+                        
+                        // Simple test
+                        this.add.text(400, 300, 'Main Game Scene Loaded!', {
+                            fontSize: '32px',
+                            fill: '#ffff00'
+                        }).setOrigin(0.5);
+                        
+                        this.add.text(400, 400, 'Game code is working!\nThe full game would load here.', {
+                            fontSize: '20px',
+                            fill: '#ffffff',
+                            align: 'center'
+                        }).setOrigin(0.5);
+                    }
+                }
+                
+                const config = {
+                    type: Phaser.AUTO,
+                    width: 800,
+                    height: 600,
+                    parent: 'game-container',
+                    backgroundColor: '#001122',
+                    scene: [TestScene, GameScene]
+                };
+                
+                console.log('Initializing Phaser game...');
+                document.getElementById('step4').className = 'step success';
+                document.getElementById('step4').textContent = '4. ✓ Initializing game...';
+                
+                const game = new Phaser.Game(config);
+                console.log('Game object created:', game);
+                
+            } catch (e) {
+                console.error('Error creating game:', e);
+                document.getElementById('errors').innerHTML += '<br>ERROR creating game: ' + e.message;
+                document.getElementById('step4').className = 'step error';
+                document.getElementById('step4').textContent = '4. ✗ Error: ' + e.message;
+            }
+            
+        } else {
+            console.error('Phaser not loaded!');
+            document.getElementById('step2').className = 'step error';
+            document.getElementById('step2').textContent = '2. ✗ Phaser failed to load';
+            document.getElementById('errors').innerHTML = 'ERROR: Phaser library failed to load. Check your internet connection.';
+        }
+    </script>
+</body>
+</html>

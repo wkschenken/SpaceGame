@@ -1,0 +1,3517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relativistic Space Race</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+        }
+        #game-container {
+            border: 3px solid #0af;
+            box-shadow: 0 0 30px rgba(0, 170, 255, 0.6);
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container"></div>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+    <script>
+    let bestEarthTime = null;
+
+    const experimentConfig = {
+        enabled: false,           // only enabled when "Test" mode is selected
+        radius: 3000,             // radial distance from start to Earth
+        // 0, 40, 80, ..., 320 (9 angles total)
+        anglesDeg: Array.from({ length: 9 }, (_, i) => i * 40),
+        trialsPerAngle: 4,
+        successes: new Array(9).fill(0),
+        attempts: new Array(9).fill(0),
+        angleIndex: 0,
+        trialIndex: 0,
+        finished: false
+    };
+
+    const baseTuningParams = {
+        vCruise: 200,
+        brakeDistScale: 1.5 * 0.75 * 1.1 * 1.1,
+        kpAngle: 4.5,
+        kdAngle: 1.8,
+        kiAngle: 0.6,
+        kpAngleCruise: 2.2,
+        kdAngleCruise: 3.0,
+        kiAngleCruise: 0.2,
+        kpAngleLand: 4.0,
+        kdAngleLand: 2.8,
+        kiAngleLand: 0.2,
+        brakeTargetVr: -25,
+        kpLateral: 0.08,
+        kiLateral: 0.0,
+        kdLateral: 0.20,
+        maxLateralAccel: 220
+    };
+
+    function cloneTuningParams(src) {
+        return {
+            vCruise: src.vCruise,
+            brakeDistScale: src.brakeDistScale,
+            kpAngle: src.kpAngle,
+            kdAngle: src.kdAngle,
+            kiAngle: src.kiAngle,
+            kpAngleCruise: src.kpAngleCruise,
+            kdAngleCruise: src.kdAngleCruise,
+            kiAngleCruise: src.kiAngleCruise,
+            kpAngleLand: src.kpAngleLand,
+            kdAngleLand: src.kdAngleLand,
+            kiAngleLand: src.kiAngleLand,
+            brakeTargetVr: src.brakeTargetVr,
+            kpLateral: src.kpLateral,
+            kiLateral: src.kiLateral,
+            kdLateral: src.kdLateral,
+            maxLateralAccel: src.maxLateralAccel
+        };
+    }
+
+    let defaultTuningParams = cloneTuningParams(baseTuningParams);
+    let activeTuningParams = cloneTuningParams(defaultTuningParams);
+    let lastAdoptedSuccessRate = null;
+
+    // Persistent mode across scene restarts: 'MENU', 'TEST', 'AUTOPILOT', 'MANUAL'
+    let globalMode = 'MENU';
+
+    // Global feature toggles for world content
+    let globalEnableMassiveObjects = false;
+    let globalEnableAsteroids = false;
+    let globalEnableTokens = false;
+
+    const TUNING_STORAGE_KEY = 'spaceGameTuning_v1';
+
+    function saveTuningToStorage() {
+        try {
+            const data = {
+                defaultParams: defaultTuningParams,
+                activeParams: activeTuningParams,
+                lastSuccess: lastAdoptedSuccessRate
+            };
+            window.localStorage.setItem(TUNING_STORAGE_KEY, JSON.stringify(data));
+        } catch (e) {
+        }
+    }
+
+    function loadTuningFromStorage() {
+        try {
+            const raw = window.localStorage.getItem(TUNING_STORAGE_KEY);
+            if (!raw) return;
+            const data = JSON.parse(raw);
+            if (data && data.defaultParams) {
+                defaultTuningParams = cloneTuningParams(data.defaultParams);
+                if (data.activeParams) {
+                    activeTuningParams = cloneTuningParams(data.activeParams);
+                } else {
+                    activeTuningParams = cloneTuningParams(defaultTuningParams);
+                }
+                if (typeof data.lastSuccess === 'number') {
+                    lastAdoptedSuccessRate = data.lastSuccess;
+                }
+            }
+        } catch (e) {
+        }
+    }
+
+    loadTuningFromStorage();
+
+    const tuningParamsDefinition = [
+        { key: 'vCruise',       label: 'Cruise speed',                 step: 20,   min: 50,   max: 800,  decimals: 0 },
+        { key: 'brakeDistScale',label: 'Brake distance scale',         step: 0.05, min: 0.1,  max: 5.0,  decimals: 2 },
+        { key: 'kpAngle',       label: 'ORIENT kp',                    step: 0.2,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kdAngle',       label: 'ORIENT kd',                    step: 0.1,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kiAngle',       label: 'ORIENT ki',                    step: 0.05, min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kpAngleCruise', label: 'CRUISE kp',                    step: 0.2,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kdAngleCruise', label: 'CRUISE kd',                    step: 0.1,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kiAngleCruise', label: 'CRUISE ki',                    step: 0.05, min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kpAngleLand',   label: 'LAND kp',                      step: 0.2,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kdAngleLand',   label: 'LAND kd',                      step: 0.1,  min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'kiAngleLand',   label: 'LAND ki',                      step: 0.05, min: 0.0,  max: 50.0, decimals: 2 },
+        { key: 'brakeTargetVr', label: 'BRAKE target v_r (negative)',  step: 5,    min: -400, max: -1,   decimals: 0 },
+        { key: 'kpLateral',     label: 'Lateral kp',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
+        { key: 'kiLateral',     label: 'Lateral ki',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
+        { key: 'kdLateral',     label: 'Lateral kd',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
+        { key: 'maxLateralAccel', label: 'Max lateral accel',          step: 10,   min: 0.0,  max: 500,  decimals: 0 }
+    ];
+
+// Autopilot Controller with EKF and 5-phase state machine
+class AutopilotController {
+    constructor(scene) {
+        this.scene = scene;
+        this.enabled = false;
+        
+        // Phase state machine (simplified)
+        this.phases = {
+            ORIENT: 0,
+            BOOST: 1,
+            CRUISE: 2,
+            BRAKE: 3,
+            LAND: 4
+        };
+        this.currentPhase = this.phases.ORIENT;
+        
+        // Control parameters
+        this.vCruise = activeTuningParams.vCruise;
+        this.aMax = 150;      // effective max decel used in braking distance calc
+        this.shipMass = 1.0;  // effective ship mass for analytic impulse calc
+        this.thrustAccel = 150; // base thrust acceleration magnitude (matches applyControl)
+        this.kBrake = 2.0;    // braking distance factor (safety margin)
+        this.maxLandingSpeed = 100;
+        this.maxLandingAngle = Phaser.Math.DegToRad(10);
+
+        // Attitude dynamics parameters (must match applyControl)
+        this.angularAccel = 3.0; // was 4.0, slightly softer turns
+        this.maxAngularSpeed = 3.5; // was 4.0
+
+        // Estimate turn time for a 180° reorientation using bang-bang angular accel.
+        const alpha = this.angularAccel;
+        // Symmetric bang-bang profile: turn π radians; approximate total time.
+        this.tTurnEst = 2 * Math.sqrt(Math.PI / Math.max(alpha, 1e-3));
+        
+        // Cached control state for visualization
+        this.lastControl = { angularControl: 0, thrust: false };
+
+        // State for tangential-velocity impulse corrections during CRUISE
+        this.vTanCorrectionActive = false;
+        this.timeSinceLastVTanCorrection = 9999; // seconds since last correction ended
+        this.vTanCorrectionBurnTime = 0;   // retained for debugging, not used for termination
+        this.vTanCorrectionElapsed = 0;    // time spent actually burning in current correction
+        this.vTanCorrectionRemainingImpulse = 0; // remaining desired impulse m*|v_tan|
+        this.vTanImpulseGain = 1.25;       // over-impulse factor to reduce undercorrection
+        
+        // State for ORIENT-phase bang-bang + fine PID control
+        this.orientBangActive = false;
+        this.orientBangSign = 0;
+        this.orientBangHalfDuration = 0;
+        this.orientBangElapsed = 0;
+        this.orientBangUsed = false; // true after the initial bang-bang schedule has completed
+        
+        // Attitude PID gains (tuned for faster convergence with damping)
+        // ORIENT/BOOST: more aggressive (higher P, I; lower D)
+        this.kpAngle = activeTuningParams.kpAngle;
+        this.kdAngle = activeTuningParams.kdAngle;
+        this.kiAngle = activeTuningParams.kiAngle;
+        this.angleErrorInt = 0;
+
+        // CRUISE/BRAKE (and early LAND) attitude PID: smoother, more damped
+        this.kpAngleCruise = activeTuningParams.kpAngleCruise;
+        this.kdAngleCruise = activeTuningParams.kdAngleCruise;
+        this.kiAngleCruise = activeTuningParams.kiAngleCruise;
+        this.angleErrorIntCruise = 0;
+
+        // LAND-phase fine attitude PID (used when speed is already low)
+        this.kpAngleLand = activeTuningParams.kpAngleLand;
+        this.kdAngleLand = activeTuningParams.kdAngleLand;
+        this.kiAngleLand = activeTuningParams.kiAngleLand;
+        this.angleErrorIntLand = 0;
+
+        this.kpLateral = activeTuningParams.kpLateral;
+        this.kiLateral = activeTuningParams.kiLateral;
+        this.kdLateral = activeTuningParams.kdLateral;
+        this.maxLateralAccel = activeTuningParams.maxLateralAccel;
+        this.lateralErrorInt = 0;
+        this.lateralLookaheadTime = 2.0;
+    }
+    
+    getSensorVector() {
+        const player = this.scene.player;
+        const earth = this.scene.earth;
+        
+        // IMU: attitude and angular velocity
+        const theta = this.scene.playerAngle;
+        const omega = this.scene.angularVelocity;
+        
+        // Earth beacon: bearing and distance
+        const dx = earth.x - player.x;
+        const dy = earth.y - player.y;
+        const distToEarth = Math.sqrt(dx * dx + dy * dy);
+        const bearingToEarth = Math.atan2(dy, dx);
+        
+        // Velocity (from IMU integration)
+        const vx = player.body.velocity.x;
+        const vy = player.body.velocity.y;
+        
+        // Resources
+        const fuelFrac = this.scene.fuel / 100;
+        const ammo = this.scene.ammo;
+        
+        return {
+            theta, omega,
+            bearingToEarth, distToEarth,
+            vx, vy,
+            fuelFrac, ammo
+        };
+    }
+
+    getSlingshotPathFrame() {
+        const plan = this.scene.slingshotPlan;
+        if (!plan) {
+            return null;
+        }
+
+        const Px = this.scene.player.x;
+        const Py = this.scene.player.y;
+        const Sx = plan.startX;
+        const Sy = plan.startY;
+        const Tx = plan.tangentX;
+        const Ty = plan.tangentY;
+
+        const dInX = plan.dirX;
+        const dInY = plan.dirY;
+
+        const dxPS = Px - Sx;
+        const dyPS = Py - Sy;
+        const s = dxPS * dInX + dyPS * dInY;
+
+        const dxST = Tx - Sx;
+        const dyST = Ty - Sy;
+        const sT = dxST * dInX + dyST * dInY;
+
+        const dxToT = Tx - Px;
+        const dyToT = Ty - Py;
+        const distToT = Math.sqrt(dxToT * dxToT + dyToT * dyToT);
+
+        const impact = typeof plan.impactParameter === 'number' ? plan.impactParameter : 0;
+        const switchDist = Math.max(40, impact * 0.5);
+
+        const beforeT = s < sT && distToT > switchDist;
+
+        const Ex = plan.earthX;
+        const Ey = plan.earthY;
+
+        let pathX;
+        let pathY;
+
+        if (beforeT && distToT > 1e-3) {
+            const lenIn = Math.sqrt(dInX * dInX + dInY * dInY) || 1;
+            pathX = dInX / lenIn;
+            pathY = dInY / lenIn;
+        } else {
+            const dxTE = Ex - Tx;
+            const dyTE = Ey - Ty;
+            const lenOut = Math.sqrt(dxTE * dxTE + dyTE * dyTE);
+            if (lenOut < 1e-3) {
+                return null;
+            }
+            pathX = dxTE / lenOut;
+            pathY = dyTE / lenOut;
+        }
+
+        return {
+            pathX,
+            pathY,
+            beforeT,
+            distToT,
+            tangentX: Tx,
+            tangentY: Ty
+        };
+    }
+    
+    computeDesiredHeading(sensors) {
+        const vx = sensors.vx;
+        const vy = sensors.vy;
+
+        // Base direction: from ship to Earth (radial inward)
+        const bearing = sensors.bearingToEarth;
+        const ex = Math.cos(bearing);
+        const ey = Math.sin(bearing);
+
+        // Decompose velocity into radial/tangential components relative to Earth
+        const radialAngleOut = bearing + Math.PI; // radial outward from Earth
+        const ux = Math.cos(radialAngleOut);
+        const uy = Math.sin(radialAngleOut);
+        const radialV = vx * ux + vy * uy;
+        const vtX = vx - radialV * ux;
+        const vtY = vy - radialV * uy;
+        const tangentialV = Math.sqrt(Math.max(0, vtX * vtX + vtY * vtY));
+
+        let vtCorrX = vtX;
+        let vtCorrY = vtY;
+        let tangentialCorr = tangentialV;
+
+        const planForV = this.scene.slingshotPlan;
+        if (planForV) {
+            const frameV = this.getSlingshotPathFrame();
+            if (frameV && frameV.beforeT) {
+                const pathX = frameV.pathX;
+                const pathY = frameV.pathY;
+                const vPar = vx * pathX + vy * pathY;
+                const vParX = vPar * pathX;
+                const vParY = vPar * pathY;
+                const offX = vx - vParX;
+                const offY = vy - vParY;
+                const offMag = Math.sqrt(Math.max(0, offX * offX + offY * offY));
+                vtCorrX = offX;
+                vtCorrY = offY;
+                tangentialCorr = offMag;
+            }
+        }
+
+        // Default desired direction: directly toward Earth
+        let nx = ex;
+        let ny = ey;
+
+        // If we have a slingshot plan and we're in ORIENT / BOOST / CRUISE,
+        // follow the planned red trajectory. The base desired heading is the
+        // local path tangent, with a small lateral bias to drive cross-track
+        // position error toward zero, instead of aiming directly at the apex T.
+        const plan = this.scene.slingshotPlan;
+        const inSlingshotPhase =
+            this.currentPhase === this.phases.ORIENT ||
+            this.currentPhase === this.phases.BOOST ||
+            this.currentPhase === this.phases.CRUISE;
+
+        if (plan && inSlingshotPhase) {
+            const frame = this.getSlingshotPathFrame();
+            if (frame && frame.beforeT) {
+                const pathX = frame.pathX;
+                const pathY = frame.pathY;
+
+                // Base heading: along the local path tangent
+                nx = pathX;
+                ny = pathY;
+
+                // Cross-track position error: distance from ship to the current
+                // path segment (S->T before apex, T->E after apex). Use this to
+                // add a small heading bias that steers the ship back toward the
+                // red line instead of just pointing along the ideal asymptote.
+                const Px = this.scene.player.x;
+                const Py = this.scene.player.y;
+                const Sx = plan.startX;
+                const Sy = plan.startY;
+                const Tx = frame.tangentX;
+                const Ty = frame.tangentY;
+
+                let baseX;
+                let baseY;
+                if (frame.beforeT) {
+                    baseX = Sx;
+                    baseY = Sy;
+                } else {
+                    baseX = Tx;
+                    baseY = Ty;
+                }
+
+                const dxPB = Px - baseX;
+                const dyPB = Py - baseY;
+                const sPar = dxPB * pathX + dyPB * pathY;
+                const projX = baseX + sPar * pathX;
+                const projY = baseY + sPar * pathY;
+                const offPosX = Px - projX;
+                const offPosY = Py - projY;
+                const offPosMag = Math.sqrt(Math.max(0, offPosX * offPosX + offPosY * offPosY));
+
+                const impact = typeof plan.impactParameter === 'number' ? plan.impactParameter : 0;
+                const maxOff = Math.max(impact * 0.5, 30);
+
+                if (offPosMag > 1e-3 && maxOff > 0) {
+                    // Sign of lateral error: positive if player is to the "left" of
+                    // the path (in the path's local frame), negative if to the right.
+                    const cross = pathX * offPosY - pathY * offPosX;
+                    const sign = cross >= 0 ? 1 : -1;
+
+                    const maxAngle = Phaser.Math.DegToRad(12); // max heading tilt for correction
+                    const scale = Phaser.Math.Clamp(offPosMag / maxOff, 0, 1);
+                    const delta = sign * maxAngle * scale;
+
+                    const cosD = Math.cos(delta);
+                    const sinD = Math.sin(delta);
+                    const adjX = pathX * cosD - pathY * sinD;
+                    const adjY = pathX * sinD + pathY * cosD;
+                    nx = adjX;
+                    ny = adjY;
+                }
+            }
+        }
+
+        // During CRUISE, if a v_tan correction is active, point exactly opposite v_tan.
+        if (this.currentPhase === this.phases.CRUISE && this.vTanCorrectionActive && tangentialCorr > 1e-3) {
+            const tx = vtCorrX / tangentialCorr;
+            const ty = vtCorrY / tangentialCorr;
+            nx = -tx;
+            ny = -ty;
+        }
+
+        let targetAngle = Math.atan2(ny, nx);
+        if (!Number.isFinite(targetAngle)) {
+            targetAngle = bearing;
+        }
+
+        // BRAKE: nose radially outward so braking thrust is purely radial
+        if (this.currentPhase === this.phases.BRAKE) {
+            targetAngle = Phaser.Math.Angle.Wrap(bearing + Math.PI);
+        }
+
+        // LAND: same radial-outward attitude for final approach
+        if (this.currentPhase === this.phases.LAND) {
+            targetAngle = Phaser.Math.Angle.Wrap(bearing + Math.PI);
+        }
+        
+        return targetAngle;
+    }
+    
+    updatePhase(sensors) {
+        const speed = Math.sqrt(sensors.vx * sensors.vx + sensors.vy * sensors.vy);
+        const dist = sensors.distToEarth;
+
+        // Decompose velocity into radial/tangential components relative to Earth
+        const radialAngle = sensors.bearingToEarth + Math.PI; // radial outward from Earth
+        const radialV = sensors.vx * Math.cos(radialAngle) + sensors.vy * Math.sin(radialAngle);
+        const tangentialV = Math.sqrt(Math.max(0, speed * speed - radialV * radialV));
+
+        // Use radial speed magnitude to determine braking distance.
+        const vRadialMag = Math.max(Math.abs(radialV), 1);
+        const brakeBase = this.kBrake * (vRadialMag * vRadialMag) / (2 * this.aMax) + this.vCruise * this.tTurnEst;
+        const brakeDist = activeTuningParams.brakeDistScale * brakeBase;
+
+        switch (this.currentPhase) {
+            case this.phases.ORIENT:
+                // Check if aligned with target heading
+                const targetHeading = this.computeDesiredHeading(sensors);
+                const angleDiff = Math.abs(Phaser.Math.Angle.Wrap(sensors.theta - targetHeading));
+                const omegaSmallOrient = Math.abs(sensors.omega) < Phaser.Math.DegToRad(0.5); // <0.5 deg/s
+                if (angleDiff < Phaser.Math.DegToRad(0.5) && omegaSmallOrient) { // ~0.5 degree
+                    // Only go straight to BRAKE if we're close enough, generally inward,
+                    // and moving at a reasonable inward speed; otherwise BOOST toward cruise.
+                    const vRadInwardEnough = radialV < -0.3 * this.vCruise;
+                    if (dist <= brakeDist && vRadInwardEnough) {
+                        console.log('Phase: ORIENT -> BRAKE');
+                        this.currentPhase = this.phases.BRAKE;
+                    } else {
+                        console.log('Phase: ORIENT -> BOOST');
+                        this.currentPhase = this.phases.BOOST;
+                    }
+                }
+                break;
+                
+            case this.phases.BOOST:
+                // Accelerate to cruise speed
+                if (speed >= this.vCruise) {
+                    this.currentPhase = this.phases.CRUISE;
+                }
+                break;
+                
+            case this.phases.CRUISE: {
+                // Prefer to enter BRAKE once we're within the braking distance and moving inward.
+                const vRadInwardEnough = radialV < -0.3 * this.vCruise;
+                if (dist <= brakeDist && vRadInwardEnough) {
+                    this.currentPhase = this.phases.BRAKE;
+                } else if (speed > 20) {
+                    // Require a sizeable inward (toward Earth) component of velocity
+                    const radialFraction = radialV / speed; // radialV < 0 means inward
+                    if (radialFraction > -0.1 && dist > brakeDist * 0.5) {
+                        // Not making good progress toward Earth and not yet deep in the
+                        // braking region; re-orient to improve trajectory.
+                        this.currentPhase = this.phases.ORIENT;
+                    }
+                }
+                break;
+            }
+
+            case this.phases.BRAKE:
+                // When slow enough, mostly radial (low tangential), moving toward Earth,
+                // and close enough to the surface, go to LAND
+                // If we start moving outward (v_r > 0), re-orient for a better braking pass.
+                if (radialV > 0) {
+                    this.currentPhase = this.phases.ORIENT;
+                } else if (
+                    dist <= 138 &&   // start LAND ~20% farther out than previous 115
+                    speed <= this.maxLandingSpeed * 1.2 &&
+                    Math.abs(tangentialV) <= this.maxLandingSpeed * 0.5 &&
+                    radialV < 0
+                ) {
+                    this.currentPhase = this.phases.LAND;
+                }
+                break;
+
+            case this.phases.LAND:
+                // Final approach - stay in this phase until touchdown
+                break;
+        }
+    }
+    
+    computeControl(sensors, dt) {
+        // PID controller for attitude
+        const desiredHeading = this.computeDesiredHeading(sensors);
+        const angleError = Phaser.Math.Angle.Wrap(desiredHeading - sensors.theta);
+        const speed = Math.sqrt(sensors.vx * sensors.vx + sensors.vy * sensors.vy);
+        const landTrimSpeed = this.maxLandingSpeed * 0.5;
+        const inLandPhase = this.currentPhase === this.phases.LAND;
+        const landTrimActive = inLandPhase && speed <= landTrimSpeed;
+
+        if (this.currentPhase !== this.phases.ORIENT) {
+            if (this.orientBangActive) {
+                this.orientBangActive = false;
+                this.orientBangElapsed = 0;
+            }
+            // Reset ORIENT bang-bang usage when leaving ORIENT so that a new
+            // phase can perform a fresh initial bang-bang maneuver.
+            this.orientBangUsed = false;
+        }
+
+        let angularControl;
+        if (inLandPhase) {
+            // LAND-phase attitude PID: always active while in LAND.
+            this.angleErrorIntLand += angleError * dt;
+            this.angleErrorIntLand = Phaser.Math.Clamp(this.angleErrorIntLand, -1.0, 1.0);
+            angularControl =
+                this.kpAngleLand * angleError +
+                this.kiAngleLand * this.angleErrorIntLand -
+                this.kdAngleLand * sensors.omega;
+            // Reset other integrators while in LAND
+            this.angleErrorIntCruise = 0;
+            this.angleErrorInt = 0;
+        } else {
+            // Phase-specific attitude PID and ORIENT bang-bang control
+            let kp = this.kpAngle;
+            let ki = this.kiAngle;
+            let kd = this.kdAngle;
+
+            const isCruiseLike =
+                this.currentPhase === this.phases.CRUISE ||
+                this.currentPhase === this.phases.BRAKE;
+
+            if (isCruiseLike) {
+                kp = this.kpAngleCruise;
+                ki = this.kiAngleCruise;
+                kd = this.kdAngleCruise;
+                this.angleErrorIntCruise += angleError * dt;
+                this.angleErrorIntCruise = Phaser.Math.Clamp(this.angleErrorIntCruise, -2.0, 2.0);
+                this.angleErrorInt = 0;
+                angularControl =
+                    kp * angleError +
+                    ki * this.angleErrorIntCruise -
+                    kd * sensors.omega;
+            } else if (this.currentPhase === this.phases.ORIENT) {
+                // In ORIENT, we perform a single bang-bang schedule to remove
+                // most of the initial error, then hand off to a sensitive PID
+                // controller to smoothly drive the residual error to zero.
+                this.angleErrorIntCruise = 0;
+
+                if (!this.orientBangUsed) {
+                    // Run the initial bang-bang schedule once.
+                    this.angleErrorInt = 0;
+
+                    if (!this.orientBangActive) {
+                        const errMag = Math.abs(angleError);
+                        const alpha = Math.max(this.angularAccel, 1e-3);
+                        const halfDuration = Math.sqrt(errMag / alpha);
+                        if (halfDuration > 0 && errMag > Phaser.Math.DegToRad(0.01)) {
+                            const sign = angleError >= 0 ? 1 : -1;
+                            this.orientBangActive = true;
+                            this.orientBangSign = sign;
+                            this.orientBangHalfDuration = halfDuration;
+                            this.orientBangElapsed = 0;
+                        } else {
+                            // If the error is already tiny, skip bang-bang and
+                            // immediately fall back to fine PID below.
+                            this.orientBangUsed = true;
+                        }
+                    }
+
+                    if (this.orientBangActive) {
+                        this.orientBangElapsed += dt;
+                        const totalDuration = 2 * this.orientBangHalfDuration;
+                        if (this.orientBangElapsed < this.orientBangHalfDuration) {
+                            angularControl = this.orientBangSign;
+                        } else if (this.orientBangElapsed < totalDuration) {
+                            angularControl = -this.orientBangSign;
+                        } else {
+                            // Bang-bang schedule completed; mark as used and
+                            // switch to the fine PID controller.
+                            this.orientBangActive = false;
+                            this.orientBangElapsed = 0;
+                            this.orientBangUsed = true;
+                        }
+                    }
+                }
+
+                if (this.orientBangUsed && !this.orientBangActive) {
+                    // Fine ORIENT PID: make it very sensitive to small errors
+                    // with tight integrator clamping so that the final error
+                    // decays smoothly to zero.
+                    const kpFine = this.kpAngle * 1.5;
+                    const kiFine = this.kiAngle;
+                    const kdFine = this.kdAngle;
+
+                    this.angleErrorInt += angleError * dt;
+                    this.angleErrorInt = Phaser.Math.Clamp(this.angleErrorInt, -0.2, 0.2);
+
+                    angularControl =
+                        kpFine * angleError +
+                        kiFine * this.angleErrorInt -
+                        kdFine * sensors.omega;
+                }
+            } else {
+                this.angleErrorInt += angleError * dt;
+                this.angleErrorInt = Phaser.Math.Clamp(this.angleErrorInt, -2.0, 2.0);
+                this.angleErrorIntCruise = 0;
+                angularControl =
+                    kp * angleError +
+                    ki * this.angleErrorInt -
+                    kd * sensors.omega;
+            }
+
+            // Reset LAND integral when not in final-trim mode
+            this.angleErrorIntLand = 0;
+        }
+        
+        // Thrust control based on phase
+        let thrust = false;
+        let thrustScale = 1.0;
+        let lateralThrust = 0;
+        
+        switch (this.currentPhase) {
+            case this.phases.ORIENT:
+                // No thrust during orientation
+                thrust = false;
+                break;
+                
+            case this.phases.BOOST: {
+                // In BOOST, apply continuous full thrust while the attitude
+                // controller keeps us aligned. ORIENT->BOOST already enforces
+                // a reasonably tight alignment (~0.5°), so additional gating
+                // here risks stalling at low speed. Simply burn until vCruise
+                // is reached, at which point updatePhase switches to CRUISE.
+                thrust = true;
+                thrustScale = 1.0;
+                break;
+            }
+                
+            case this.phases.CRUISE: {
+                // Discrete v_tan impulse correction:
+                // If |v_tan| exceeds a threshold, compute an impulse with fixed
+                // burn duration T_impulse and variable thrust scale so that the
+                // net impulse matches m*|v_tan| (subject to thrust limits).
+                const bearing = sensors.bearingToEarth;
+                const dist = sensors.distToEarth;
+                const radialAngleOut = bearing + Math.PI;
+                const ux = Math.cos(radialAngleOut);
+                const uy = Math.sin(radialAngleOut);
+                const radialV = sensors.vx * ux + sensors.vy * uy;
+                const vtX = sensors.vx - radialV * ux;
+                const vtY = sensors.vy - radialV * uy;
+                const tangentialV = Math.sqrt(Math.max(0, vtX * vtX + vtY * vtY));
+
+                // By default, use Earth-radial decomposition. When a slingshot plan
+                // exists, reinterpret these as path-parallel ("radialForControl") and
+                // path-perpendicular ("tangentialForControl") components so that
+                // CRUISE corrections keep the ship near the planned red trajectory.
+                let tangentialForControl = tangentialV;
+                let radialForControl = radialV;
+
+                const planCruise = this.scene.slingshotPlan;
+                let frameCruise = null;
+                let slingshotApproach = false;
+                if (planCruise) {
+                    frameCruise = this.getSlingshotPathFrame();
+                    if (frameCruise && frameCruise.beforeT) {
+                        slingshotApproach = true;
+                    }
+                }
+
+                if (slingshotApproach && frameCruise) {
+                    const pathX = frameCruise.pathX;
+                    const pathY = frameCruise.pathY;
+                    const vPar = sensors.vx * pathX + sensors.vy * pathY;
+                    const vParX = vPar * pathX;
+                    const vParY = vPar * pathY;
+                    const offX = sensors.vx - vParX;
+                    const offY = sensors.vy - vParY;
+                    const offMag = Math.sqrt(Math.max(0, offX * offX + offY * offY));
+
+                    tangentialForControl = offMag;
+                    radialForControl = vPar;
+
+                    // Path-relative cross-track control for side thrusters.
+                    const Px = this.scene.player.x;
+                    const Py = this.scene.player.y;
+                    const Sx = planCruise.startX;
+                    const Sy = planCruise.startY;
+                    const Tx = frameCruise.tangentX;
+                    const Ty = frameCruise.tangentY;
+
+                    let baseX;
+                    let baseY;
+                    if (frameCruise.beforeT) {
+                        baseX = Sx;
+                        baseY = Sy;
+                    } else {
+                        baseX = Tx;
+                        baseY = Ty;
+                    }
+
+                    const dxPB = Px - baseX;
+                    const dyPB = Py - baseY;
+                    const sPar = dxPB * pathX + dyPB * pathY;
+                    const projX = baseX + sPar * pathX;
+                    const projY = baseY + sPar * pathY;
+                    const offPosX = Px - projX;
+                    const offPosY = Py - projY;
+
+                    // Signed cross-track position error: positive if ship is to
+                    // the left of the path (in path frame), negative if to the right.
+                    const crossPos = pathX * offPosY - pathY * offPosX;
+
+                    // Cross-track velocity component (lateral velocity in path frame).
+                    const vLat = sensors.vx * (-pathY) + sensors.vy * pathX;
+
+                    const impact = typeof planCruise.impactParameter === 'number' ? planCruise.impactParameter : 0;
+                    const maxOff = Math.max(impact * 0.5, 30);
+
+                    // Simple lookahead to anticipate crossing the path: predict where
+                    // the cross-track error will be after a short time horizon.
+                    const lookahead = this.lateralLookaheadTime;
+                    const predictedErr = crossPos + vLat * lookahead;
+                    const clampedPosErr = Phaser.Math.Clamp(predictedErr, -maxOff, maxOff);
+
+                    // PID on predicted cross-track error using side thrusters as actuator.
+                    this.lateralErrorInt += clampedPosErr * dt;
+                    this.lateralErrorInt = Phaser.Math.Clamp(this.lateralErrorInt, -maxOff, maxOff);
+
+                    // Use negative feedback: when crossPos is positive (ship left of
+                    // path), command acceleration that pushes it right, and vice versa.
+                    const aLatCmd =
+                        -this.kpLateral * clampedPosErr +
+                        -this.kiLateral * this.lateralErrorInt +
+                        -this.kdLateral * vLat;
+                    lateralThrust = Phaser.Math.Clamp(aLatCmd, -this.maxLateralAccel, this.maxLateralAccel);
+                }
+
+                // Distance-dependent thresholds: allow larger v_tan far away,
+                // but tighten the requirement as we get closer to Earth.
+                // Example: at dist >= 5000, tolerate up to ~2 units before correcting;
+                // near Earth (~500), tolerate only ~0.5 before correcting and stop at ~0.05.
+                const maxDist = 5000;
+                const minDist = 500;
+                const clampedDist = Phaser.Math.Clamp(dist, minDist, maxDist);
+                const lerp = (clampedDist - minDist) / (maxDist - minDist); // 0 near Earth, 1 far away
+
+                const vTanStartFar = 6.0; // require larger v_tan to trigger correction far away
+                const vTanStartNear = 0.6;
+
+                const vTanStart = vTanStartNear + (vTanStartFar - vTanStartNear) * lerp;
+
+                // Simple cooldown: wait some time after the last correction before
+                // starting a new one, to avoid back-to-back impulses.
+                const cooldown = 1.5; // seconds
+
+                // When following a slingshot path, rely on continuous heading and
+                // side-thruster control to stay near the red line and skip the
+                // discrete v_tan impulse corrections.
+                if (!slingshotApproach &&
+                    !this.vTanCorrectionActive &&
+                    this.timeSinceLastVTanCorrection > cooldown &&
+                    tangentialForControl > vTanStart) {
+                    // Start a new analytic correction: snapshot |v_tan| and compute
+                    // the desired impulse I = m*|v_tan| (with a small gain) to cancel it.
+                    const vTanMag = tangentialForControl;
+                    const m = this.shipMass;
+                    const gain = this.vTanImpulseGain || 1.0;
+                    this.vTanCorrectionRemainingImpulse = m * vTanMag * gain;
+                    this.vTanCorrectionElapsed = 0;
+                    this.vTanCorrectionBurnTime = 0;
+                    this.vTanCorrectionActive = true;
+                }
+
+                // If a correction is active, burn until the remaining impulse is exhausted.
+                if (!slingshotApproach && this.vTanCorrectionActive && this.vTanCorrectionRemainingImpulse > 0) {
+                    // Thrust only while we are in correction mode and roughly aligned with
+                    // the anti-v_tan heading chosen in computeDesiredHeading.
+                    const aligned = Math.abs(angleError) < 0.2; // ~11.5 deg
+                    if (aligned) {
+                        const F0 = this.thrustAccel;
+                        const maxImpulseThisFrame = F0 * dt; // full-thrust impulse this frame
+
+                        if (this.vTanCorrectionRemainingImpulse > maxImpulseThisFrame) {
+                            // Coarse phase: burn full thrust this frame
+                            thrust = true;
+                            thrustScale = 1.0;
+                            this.vTanCorrectionRemainingImpulse -= maxImpulseThisFrame;
+                        } else {
+                            // Fine phase: last partial-thrust frame to hit target exactly
+                            const scale = this.vTanCorrectionRemainingImpulse / maxImpulseThisFrame;
+                            thrust = true;
+                            thrustScale = Phaser.Math.Clamp(scale, 0, 1);
+                            this.vTanCorrectionRemainingImpulse = 0;
+                        }
+
+                        // Track elapsed burn time for diagnostics
+                        this.vTanCorrectionElapsed += dt;
+                    } else {
+                        thrust = false;
+                    }
+
+                    // If we've exhausted the desired impulse (or effectively so), end correction.
+                    if (this.vTanCorrectionRemainingImpulse <= 1e-4) {
+                        this.vTanCorrectionActive = false;
+                        this.timeSinceLastVTanCorrection = 0;
+                        this.vTanCorrectionBurnTime = 0;
+                        this.vTanCorrectionRemainingImpulse = 0;
+                    }
+                }
+
+                // Radial-velocity maintenance: if we're not in a v_tan correction and
+                // the radial speed toward Earth has dropped too low (or become outward),
+                // apply thrust while aligned to restore the controlled "radial" speed
+                // toward vCruise. When no slingshot plan exists, this is Earth-radial;
+                // when a plan exists, it is the path-parallel component along the red
+                // trajectory.
+                if (!this.vTanCorrectionActive && !thrust) {
+                    const vRadMinMag = this.vCruise; // desired minimum controlled speed ~ vCruise
+                    let needMoreInward;
+
+                    if (slingshotApproach) {
+                        // Path-relative: radialForControl is vPar along the red path.
+                        // Thrust until the along-path speed reaches ~vCruise; do not
+                        // continue accelerating once we've exceeded that.
+                        needMoreInward = radialForControl < vRadMinMag;
+                    } else {
+                        // Original Earth-radial logic
+                        needMoreInward = (radialForControl >= 0) || (Math.abs(radialForControl) < vRadMinMag);
+                    }
+                    if (needMoreInward) {
+                        const alignedRadialInward = Math.abs(angleError) < 0.3; // slightly looser heading gate
+                        if (alignedRadialInward) {
+                            thrust = true;
+                        }
+                    }
+                }
+
+                break;
+            }
+
+            case this.phases.BRAKE: {
+                // Thrust to decelerate until inward radial speed is reduced to ~50 units,
+                // but only once we're aligned with the radial-outward heading.
+                const bearing = sensors.bearingToEarth;
+                const radialAngleOut = bearing + Math.PI;
+                const ux = Math.cos(radialAngleOut);
+                const uy = Math.sin(radialAngleOut);
+                const radialV = sensors.vx * ux + sensors.vy * uy; // outward > 0, inward < 0
+
+                const alignedForBrake = Math.abs(angleError) < 0.2; // wider window to reduce pulsing
+                const targetInwardSpeed = activeTuningParams.brakeTargetVr; // desired inward radial velocity after braking
+                const needMoreBrake = radialV < targetInwardSpeed; // still too fast inward
+
+                thrust = alignedForBrake && needMoreBrake;
+                if (thrust) {
+                    // Slightly reduced thrust during BRAKE
+                    thrustScale = 0.95;
+                }
+                break;
+            }
+
+            case this.phases.LAND: {
+                // Early in LAND, allow some thrust to keep speed under control;
+                // once in final-trim regime, rely on gravity only and adjust attitude.
+                if (!landTrimActive) {
+                    thrust = speed > this.maxLandingSpeed * 0.8;
+                    if (thrust) {
+                        // Slightly reduced thrust during LAND burns
+                        thrustScale = 0.95;
+                    }
+                } else {
+                    thrust = false;
+                }
+
+                // While in LAND with the nose pointed roughly away from Earth, use
+                // side thrusters to damp the tangential component of velocity
+                // relative to the radial-outward direction.
+                const alignedForLand = Math.abs(angleError) < Phaser.Math.DegToRad(5.0);
+                if (alignedForLand) {
+                    const theta = sensors.theta;
+                    const perpX = -Math.sin(theta);
+                    const perpY = Math.cos(theta);
+
+                    // Lateral velocity in the ship's frame (perpendicular to nose).
+                    const vLat = sensors.vx * perpX + sensors.vy * perpY;
+
+                    // Only engage side thrusters when there is a noticeable
+                    // tangential component to clean up.
+                    const vLatThreshold = 2.0;
+                    if (Math.abs(vLat) > vLatThreshold) {
+                        const aLatCmd = -this.kpLateral * vLat;
+                        lateralThrust = Phaser.Math.Clamp(
+                            aLatCmd,
+                            -this.maxLateralAccel,
+                            this.maxLateralAccel
+                        );
+                    }
+                }
+                break;
+            }
+        }
+        
+        return { angularControl, thrust, thrustScale, lateralThrust };
+    }
+    
+    update(dt) {
+        if (!this.enabled) {
+            this.lastControl = { angularControl: 0, thrust: false };
+            return;
+        }
+        
+        try {
+            // Advance timers
+            this.timeSinceLastVTanCorrection += dt;
+
+            // Get sensor readings
+            const sensors = this.getSensorVector();
+            
+            // Update phase
+            this.updatePhase(sensors);
+            
+            // Compute control commands
+            const control = this.computeControl(sensors, dt);
+            
+            // Debug: log control state occasionally
+            if (!this.debugCounter) this.debugCounter = 0;
+            this.debugCounter++;
+            if (this.debugCounter % 60 === 0) {
+                console.log('Autopilot active - Phase:', this.getPhaseString(), 
+                           'Angular:', control.angularControl.toFixed(2), 
+                           'Thrust:', control.thrust);
+            }
+            
+            // Cache for visualization
+            this.lastControl = control;
+            
+            // Apply controls to game
+            this.applyControl(control, dt);
+            
+            // Asteroid defense system (independent of main control)
+            this.asteroidDefense(dt);
+        } catch (error) {
+            console.error('Autopilot error:', error);
+            this.enabled = false;
+        }
+    }
+    
+    asteroidDefense(dt) {
+        // Auto-aim and fire at threatening asteroids
+        const player = this.scene.player;
+        
+        if (!this.scene.asteroids) return;
+        const asteroids = this.scene.asteroids.getChildren();
+        
+        const threatRange = 400;
+        const fireRate = 0.2; // seconds between shots
+        
+        if (!this.lastFireTime) this.lastFireTime = 0;
+        this.lastFireTime += dt;
+        
+        if (this.lastFireTime < fireRate || this.scene.ammo <= 0) return;
+        
+        // Find closest threatening asteroid
+        let closestThreat = null;
+        let closestDist = Infinity;
+        
+        asteroids.forEach(asteroid => {
+            const dx = asteroid.x - player.x;
+            const dy = asteroid.y - player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist < threatRange && dist < closestDist) {
+                // Check if asteroid is approaching (dot product with relative velocity)
+                const relVx = asteroid.body.velocity.x - player.body.velocity.x;
+                const relVy = asteroid.body.velocity.y - player.body.velocity.y;
+                const approaching = (dx * relVx + dy * relVy) < 0;
+                
+                if (approaching) {
+                    closestThreat = asteroid;
+                    closestDist = dist;
+                }
+            }
+        });
+        
+        // Fire at the threat with lead angle calculation
+        if (closestThreat) {
+            const dx = closestThreat.x - player.x;
+            const dy = closestThreat.y - player.y;
+            
+            // Calculate lead angle for moving target
+            const bulletSpeed = 600;
+            const relVx = closestThreat.body.velocity.x - player.body.velocity.x;
+            const relVy = closestThreat.body.velocity.y - player.body.velocity.y;
+            
+            // Simple lead: estimate time to impact and aim ahead
+            const timeToImpact = closestDist / bulletSpeed;
+            const leadX = dx + relVx * timeToImpact;
+            const leadY = dy + relVy * timeToImpact;
+            const aimAngle = Math.atan2(leadY, leadX);
+            
+            // Fire bullet in calculated direction
+            this.fireDefensiveBullet(aimAngle);
+            this.lastFireTime = 0;
+        }
+    }
+    
+    fireDefensiveBullet(angle) {
+        const player = this.scene.player;
+        const speed = 600;
+        
+        const bullet = this.scene.bullets.create(player.x, player.y, null);
+        bullet.setCircle(5);
+        bullet.displayWidth = 10;
+        bullet.displayHeight = 10;
+        bullet.setTint(0xff0000);
+        
+        bullet.vx = Math.cos(angle) * speed + player.body.velocity.x;
+        bullet.vy = Math.sin(angle) * speed + player.body.velocity.y;
+        
+        this.scene.ammo--;
+    }
+    
+    applyControl(control, dt) {
+        // Track total fuel usage this frame (main + lateral thrusters)
+        let totalFuelUse = 0;
+
+        // Apply angular control
+        if (control.angularControl > 0) {
+            // Turn right
+            this.scene.angularVelocity += this.angularAccel * dt;
+        } else if (control.angularControl < 0) {
+            // Turn left
+            this.scene.angularVelocity -= this.angularAccel * dt;
+        }
+        
+        this.scene.angularVelocity = Phaser.Math.Clamp(
+            this.scene.angularVelocity,
+            -this.maxAngularSpeed,
+            this.maxAngularSpeed
+        );
+        
+        // Integrate angular velocity to update angle
+        this.scene.playerAngle += this.scene.angularVelocity * dt;
+        
+        // Apply thrust
+        if (control.thrust && this.scene.fuel > 0) {
+            const thrustBase = 150;
+            const scale = typeof control.thrustScale === 'number' ? control.thrustScale : 1.0;
+            const thrust = thrustBase * scale;
+            const vx = Math.cos(this.scene.playerAngle) * thrust * dt;
+            const vy = Math.sin(this.scene.playerAngle) * thrust * dt;
+            this.scene.player.body.velocity.x += vx;
+            this.scene.player.body.velocity.y += vy;
+            this.scene.isThrusting = true;
+
+            // Fuel usage proportional to main thrust magnitude.
+            const mainFuelRate = 0.015; // tuned so typical autopilot trip uses ~half tank
+            totalFuelUse += thrust * dt * mainFuelRate;
+        } else {
+            this.scene.isThrusting = false;
+        }
+
+        // Apply lateral thrust (side boosters) without changing attitude.
+        if (control.lateralThrust && this.scene.fuel > 0) {
+            const aLat = Phaser.Math.Clamp(control.lateralThrust, -this.maxLateralAccel, this.maxLateralAccel);
+            const perpX = -Math.sin(this.scene.playerAngle);
+            const perpY = Math.cos(this.scene.playerAngle);
+            const dvx = perpX * aLat * dt;
+            const dvy = perpY * aLat * dt;
+            this.scene.player.body.velocity.x += dvx;
+            this.scene.player.body.velocity.y += dvy;
+
+            // Fuel usage proportional to absolute lateral acceleration, but
+            // at a lower rate than the main thruster.
+            const sideFuelRate = 0.005;
+            totalFuelUse += Math.abs(aLat) * dt * sideFuelRate;
+
+            // Visual flags for side thrusters
+            this.scene.sideThrustLeft = aLat > 0;
+            this.scene.sideThrustRight = aLat < 0;
+        } else {
+            this.scene.sideThrustLeft = false;
+            this.scene.sideThrustRight = false;
+        }
+
+        // Apply accumulated fuel usage from this frame's thrust commands.
+        if (totalFuelUse > 0) {
+            this.scene.fuel = Math.max(0, this.scene.fuel - totalFuelUse);
+        }
+    }
+    
+    getPhaseString() {
+        const phaseNames = ['ORIENT', 'BOOST', 'CRUISE', 'BRAKE', 'LAND'];
+        return phaseNames[this.currentPhase];
+    }
+}
+
+class GameScene extends Phaser.Scene {
+    constructor() {
+        super({ key: 'GameScene' });
+    }
+
+    create() {
+        const width = this.cameras.main.width;
+        const height = this.cameras.main.height;
+        
+        // Fixed large square world: 10000 x 10000
+        this.worldSize = 10000;
+        this.worldWidth = this.worldSize;
+        this.worldHeight = this.worldSize;
+        this.physics.world.setBounds(0, 0, this.worldWidth, this.worldHeight);
+
+        // Game state
+        this.shipTime = 0;
+        this.earthTime = 0;
+        this.fuel = 100;
+        this.ammo = 50;
+        this.gameOver = false;
+        this.sideThrustLeft = false;
+        this.sideThrustRight = false;
+
+        // State for numerical slingshot refinement sweep
+        this.slingshotSweepActive = false;
+        this.slingshotSweepAngle = 0;
+        this.slingshotSweepMaxAngle = 0;
+        this.slingshotSweepStep = 0;
+        this.slingshotSweepBestAngle = null;
+        this.slingshotSweepBestResult = null;
+        this.slingshotSweepBestScore = Number.POSITIVE_INFINITY;
+        this.slingshotSweepTotalSteps = 0;
+        this.slingshotSweepDoneSteps = 0;
+        this.slingshotSweepText = null;
+
+        // Mode selection for this scene instance
+        this.mode = globalMode;
+        this.testOverallSuccess = null;
+
+        // Create background stars
+        this.createBackground();
+        
+        // Initialize start and destination positions.
+        if (experimentConfig.enabled) {
+            this.mode = 'TEST';
+            this.initializeExperimentStartAndDestination();
+        } else {
+            this.initializeStartAndDestination();
+        }
+        this.createPlayer();
+        this.createEarth();
+        
+        // Create obstacles
+        this.createAsteroids();
+        this.createGravityObjects();
+        this.createPickups();
+        
+        // Plan an initial slingshot path (requires massive objects). If we are
+        // in AUTOPILOT or TEST modes and a slingshot plan exists, kick off the
+        // numerical refinement sweep. The sweep itself runs incrementally in
+        // update() so we can display progress before the run begins.
+        this.planSlingshotPath();
+        if ((this.mode === 'AUTOPILOT' || this.mode === 'TEST') && this.slingshotPlan) {
+            this.refineSlingshotPlanNumerically();
+        }
+        
+        // Setup camera (locked to ship center)
+        this.cameras.main.startFollow(this.player, true, 1, 1);
+        this.cameras.main.setBounds(0, 0, this.worldWidth, this.worldHeight);
+        
+        // UI
+        this.createUI();
+        if (!experimentConfig.enabled && this.mode === 'MENU') {
+            this.createStartMenu();
+        }
+        
+        // Controls
+        this.cursors = this.input.keyboard.createCursorKeys();
+        this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+        this.autopilotKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
+        
+        // Autopilot controller
+        this.autopilot = new AutopilotController(this);
+        this.autopilot.enabled = false;
+        
+        // Bullets
+        this.bullets = this.physics.add.group();
+        
+        // Collisions
+        this.physics.add.overlap(this.player, this.earth, this.winGame, null, this);
+        this.physics.add.collider(this.player, this.asteroids, this.loseGame, null, this);
+        this.physics.add.overlap(this.player, this.fuelPickups, this.collectFuel, null, this);
+        this.physics.add.overlap(this.player, this.ammoPickups, this.collectAmmo, null, this);
+        
+        console.log('Game created! Player at:', this.player.x, this.player.y, 'Earth at:', this.earth.x, this.earth.y);
+    }
+
+    createBackground() {
+        // Create scrolling starfield
+        this.bg = this.add.graphics();
+        this.bg.setScrollFactor(0);
+        
+        this.bgStars = [];
+        // Increased star count (x3)
+        for (let i = 0; i < 600; i++) {
+            this.bgStars.push({
+                x: Math.random() * 1200,
+                y: Math.random() * 800,
+                size: Math.random() * 2 + 0.5,
+                alpha: Math.random() * 0.7 + 0.3
+            });
+        }
+    }
+
+    initializeStartAndDestination() {
+        const worldSize = this.worldSize;
+        const marginStart = 200;
+        const marginEarth = 200;
+        const minFactor = 0.8;
+        const maxFactor = 1.2;
+        const maxAttempts = 100;
+
+        let attempt = 0;
+        while (attempt < maxAttempts) {
+            attempt++;
+
+            const startX = Phaser.Math.Between(marginStart, worldSize - marginStart);
+            const startY = Phaser.Math.Between(marginStart, worldSize - marginStart);
+
+            const angle = Math.random() * Math.PI * 2;
+            const distanceFactor = minFactor + Math.random() * (maxFactor - minFactor);
+            const distance = worldSize * distanceFactor;
+
+            const earthX = startX + Math.cos(angle) * distance;
+            const earthY = startY + Math.sin(angle) * distance;
+
+            if (
+                earthX > marginEarth && earthX < worldSize - marginEarth &&
+                earthY > marginEarth && earthY < worldSize - marginEarth
+            ) {
+                this.startX = startX;
+                this.startY = startY;
+                this.earthX = earthX;
+                this.earthY = earthY;
+                return;
+            }
+        }
+
+        // Fallback to deterministic positions if randomization fails
+        this.startX = this.worldWidth * 0.25;
+        this.startY = this.worldHeight * 0.5;
+        this.earthX = this.worldWidth * 0.75;
+        this.earthY = this.worldHeight * 0.5;
+    }
+
+    initializeExperimentStartAndDestination() {
+        // Use the same S->E distance range and world geometry as normal
+        // Autopilot mode, but constrain the *direction* of the S->E vector
+        // to the current experiment angle. This makes TEST runs comparable
+        // to real Autopilot runs while still sweeping approach angles.
+
+        // First, generate a reasonable start/Earth pair using the normal
+        // initializer (random position, distance in [0.8, 1.2] * worldSize,
+        // and within margins).
+        this.initializeStartAndDestination();
+
+        const baseSx = this.startX;
+        const baseSy = this.startY;
+        const baseEx = this.earthX;
+        const baseEy = this.earthY;
+
+        const dx = baseEx - baseSx;
+        const dy = baseEy - baseSy;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+
+        // Preserve the original S->E distance but rotate its direction to
+        // match the current experiment angle, while ensuring that both the
+        // start and Earth positions remain inside the world margins.
+        const angleDeg = experimentConfig.anglesDeg[experimentConfig.angleIndex];
+        const angleRad = Phaser.Math.DegToRad(angleDeg);
+        const ux = Math.cos(angleRad);
+        const uy = Math.sin(angleRad);
+
+        const worldSize = this.worldSize;
+        const marginStart = 200;
+        const marginEarth = 200;
+        const maxAttempts = 200;
+
+        let placed = false;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const candidateStartX = Phaser.Math.Between(marginStart, worldSize - marginStart);
+            const candidateStartY = Phaser.Math.Between(marginStart, worldSize - marginStart);
+            const candidateEarthX = candidateStartX + ux * len;
+            const candidateEarthY = candidateStartY + uy * len;
+
+            if (
+                candidateEarthX > marginEarth && candidateEarthX < worldSize - marginEarth &&
+                candidateEarthY > marginEarth && candidateEarthY < worldSize - marginEarth
+            ) {
+                this.startX = candidateStartX;
+                this.startY = candidateStartY;
+                this.earthX = candidateEarthX;
+                this.earthY = candidateEarthY;
+                placed = true;
+                break;
+            }
+        }
+
+        if (!placed) {
+            // If we cannot find a placement that fits the requested angle and
+            // distance within the world, fall back to the original Autopilot
+            // geometry for this trial.
+            this.startX = baseSx;
+            this.startY = baseSy;
+            this.earthX = baseEx;
+            this.earthY = baseEy;
+        }
+    }
+
+    createPlayer() {
+        // Start player near left side of world
+        const startX = this.startX;
+        const startY = this.startY;
+        
+        // Physics body (invisible circle for collisions & motion)
+        this.player = this.add.circle(startX, startY, 15, 0x000000);
+        this.player.setVisible(false);
+        this.physics.add.existing(this.player);
+        this.player.body.setCircle(15);
+        this.player.body.setDrag(0);
+        this.player.body.setMaxVelocity(400);
+        this.player.body.setCollideWorldBounds(false);
+        
+        // Ship orientation: 0 rad points along +X (to the right)
+        this.playerAngle = 0;
+        this.angularVelocity = 0;
+        
+        // Visual ship body, drawn as a sleek triangular craft
+        this.shipBody = this.add.graphics();
+    }
+
+    createEarth() {
+        // Place Earth at right side, ensuring it's visible from start
+        const earthX = this.earthX;
+        const earthY = this.earthY;
+        
+        this.earth = this.add.circle(earthX, earthY, 80, 0x0088ff);
+        this.earth.setStrokeStyle(4, 0x00aaff);
+        
+        // Add glow effect
+        this.earthGlow = this.add.circle(earthX, earthY, 120, 0x0088ff, 0.3);
+        
+        this.physics.add.existing(this.earth);
+        this.earth.body.setCircle(80);
+        this.earth.body.setImmovable(true);
+        
+        console.log('Earth created at:', earthX, earthY);
+    }
+
+    createAsteroids() {
+        // Keep an empty asteroid group so other systems can safely reference it,
+        // but do not spawn any actual asteroids while focusing on takeoff/landing.
+        this.asteroids = this.physics.add.group();
+
+        if (!globalEnableAsteroids) {
+            return;
+        }
+
+        const worldSize = this.worldSize;
+        const count = 20; // reduced density compared to original field
+
+        for (let i = 0; i < count; i++) {
+            const x = Math.random() * worldSize;
+            const y = Math.random() * worldSize;
+            const radius = Phaser.Math.Between(8, 18);
+
+            const asteroid = this.add.circle(x, y, radius, 0x666666);
+            this.physics.add.existing(asteroid);
+            asteroid.body.setCircle(radius);
+            asteroid.body.setBounce(1, 1);
+            asteroid.body.setCollideWorldBounds(false);
+            asteroid.body.setVelocity(
+                Phaser.Math.Between(-50, 50),
+                Phaser.Math.Between(-50, 50)
+            );
+
+            this.asteroids.add(asteroid);
+        }
+    }
+
+    createGravityObjects() {
+        // No external gravity objects while debugging pure Earth approach
+        this.gravityObjects = [];
+
+        if (!globalEnableMassiveObjects) {
+            return;
+        }
+
+        // Single massive object placed near the straight start->Earth baseline.
+        const Sx = this.startX;
+        const Sy = this.startY;
+        const Ex = this.earthX;
+        const Ey = this.earthY;
+        const dxSE = Ex - Sx;
+        const dySE = Ey - Sy;
+        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE) || 1;
+        const uxSE = dxSE / lenSE;
+        const uySE = dySE / lenSE;
+
+        // Unit perpendicular to the baseline
+        const px = -uySE;
+        const py = uxSE;
+
+        // Sample a random position for the massive object from a Gaussian
+        // distribution centered at the midpoint between S and E. We use a
+        // 2D Gaussian expressed in the (along-baseline, perpendicular)
+        // coordinate frame, with variance proportional to half the S-E
+        // distance so typical samples lie of order sqrt(lenSE) from the
+        // midpoint.
+
+        // Midpoint along the baseline in world coordinates.
+        const midX = Sx + uxSE * (lenSE * 0.5);
+        const midY = Sy + uySE * (lenSE * 0.5);
+
+        // One-dimensional Gaussian sampler (Box-Muller transform).
+        const sampleGaussian = () => {
+            let u1 = Math.random();
+            let u2 = Math.random();
+            u1 = u1 < 1e-8 ? 1e-8 : u1;
+            return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        };
+
+        // Standard deviation chosen so that variance is proportional to
+        // half of the S-E distance.
+        const variance = 0.5 * lenSE;
+        const stdDev = Math.sqrt(Math.max(variance, 1e-3));
+
+        const alongOffset = sampleGaussian() * stdDev;
+        const perpOffset = sampleGaussian() * stdDev;
+
+        const objX = midX + uxSE * alongOffset + px * perpOffset;
+        const objY = midY + uySE * alongOffset + py * perpOffset;
+
+        const radius = 35;
+        const obj = this.add.circle(objX, objY, radius, 0xffaa00, 0.6);
+        this.physics.add.existing(obj);
+        obj.body.setCircle(radius);
+        obj.body.setImmovable(true);
+
+        // Gravity parameters stored on the object
+        obj.setData('gravityStrength', 76800);
+        obj.setData('schwarzschildRadius', radius * 1.5);
+        obj.setData('mass', 80);
+
+        this.gravityObjects.push(obj);
+    }
+
+    createPickups() {
+        // Create empty pickup groups so collision handlers still work, but do not
+        // spawn any fuel or ammo tokens during guidance tuning.
+        this.fuelPickups = this.physics.add.group();
+        this.ammoPickups = this.physics.add.group();
+
+        if (!globalEnableTokens) {
+            return;
+        }
+
+        const worldSize = this.worldSize;
+
+        const fuelCount = 6;  // reduced density
+        const ammoCount = 6;  // reduced density
+
+        for (let i = 0; i < fuelCount; i++) {
+            const x = Math.random() * worldSize;
+            const y = Math.random() * worldSize;
+            const fuel = this.add.rectangle(x, y, 10, 14, 0x00ff00);
+            this.physics.add.existing(fuel);
+            fuel.body.setImmovable(true);
+            this.fuelPickups.add(fuel);
+        }
+
+        for (let i = 0; i < ammoCount; i++) {
+            const x = Math.random() * worldSize;
+            const y = Math.random() * worldSize;
+            const ammo = this.add.rectangle(x, y, 10, 10, 0xffff00);
+            this.physics.add.existing(ammo);
+            ammo.body.setImmovable(true);
+            this.ammoPickups.add(ammo);
+        }
+    }
+
+    planSlingshotPath() {
+        // Clear any previous plan and debug graphics
+        if (this.slingshotDebug) {
+            this.slingshotDebug.destroy();
+            this.slingshotDebug = null;
+        }
+        this.slingshotPlan = null;
+
+        if (!this.gravityObjects || this.gravityObjects.length === 0) {
+            return;
+        }
+
+        const Sx = this.startX;
+        const Sy = this.startY;
+        const Ex = this.earthX;
+        const Ey = this.earthY;
+
+        const dxSE = Ex - Sx;
+        const dySE = Ey - Sy;
+        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
+        if (lenSE < 1e-3) {
+            return;
+        }
+
+        const ux = dxSE / lenSE;
+        const uy = dySE / lenSE;
+
+        let bestObj = null;
+        let bestT = Number.POSITIVE_INFINITY;
+        let bestPerpDist = 0;
+        let bestCorridorRadius = 0;
+
+        const corridorFactor = 1.0; // R_corridor = corridorFactor * schwarzschildRadius (tighter: only very close objects impede)
+
+        this.gravityObjects.forEach(obj => {
+            const Cx = obj.x;
+            const Cy = obj.y;
+            const rx = Cx - Sx;
+            const ry = Cy - Sy;
+
+            const t = rx * ux + ry * uy; // projection distance along S->E direction
+            if (t <= 0) {
+                return; // object is effectively behind the start
+            }
+
+            const projX = Sx + t * ux;
+            const projY = Sy + t * uy;
+            const perpX = Cx - projX;
+            const perpY = Cy - projY;
+            const dPerp = Math.sqrt(perpX * perpX + perpY * perpY);
+
+            const schwarzschildRadius = obj.getData('schwarzschildRadius') || 0;
+            if (schwarzschildRadius <= 0) {
+                return;
+            }
+            const corridorRadius = corridorFactor * schwarzschildRadius;
+
+            if (dPerp < corridorRadius && t < bestT) {
+                bestT = t;
+                bestObj = obj;
+                bestPerpDist = dPerp;
+                bestCorridorRadius = corridorRadius;
+            }
+        });
+
+        if (!bestObj) {
+            return; // no interfering massive object found along initial straight path
+        }
+
+        const Cx = bestObj.x;
+        const Cy = bestObj.y;
+
+        // Incoming direction: along initial S->E line
+        const dinx = ux;
+        const diny = uy;
+
+        // Desired outgoing direction: radial from object to Earth
+        const dxOE = Ex - Cx;
+        const dyOE = Ey - Cy;
+        const lenOE = Math.sqrt(dxOE * dxOE + dyOE * dyOE);
+        if (lenOE < 1e-3) {
+            return;
+        }
+        const doutx = dxOE / lenOE;
+        const douty = dyOE / lenOE;
+
+        // Deflection angle χ between din and dout
+        const dot = Phaser.Math.Clamp(dinx * doutx + diny * douty, -1, 1);
+        let chi = Math.acos(dot);
+
+        // Numerical sanity check: if chi is not finite, abort.
+        if (!Number.isFinite(chi)) {
+            return;
+        }
+
+        // Estimate impact parameter b from scattering formula
+        const mu = bestObj.getData('gravityStrength');
+        const vInf = activeTuningParams.vCruise;
+        if (typeof mu !== 'number' || mu <= 0 || vInf <= 0) {
+            return;
+        }
+
+        const halfChi = chi * 0.5;
+        const tanHalfChi = Math.tan(halfChi);
+        if (Math.abs(tanHalfChi) < 1e-3) {
+            return;
+        }
+
+        // Baseline asymptotic impact parameter from scattering
+        let b = mu / (vInf * vInf * tanHalfChi);
+
+        // Simple empirical adjustment: reduce the impact parameter slightly
+        // relative to the pure scattering formula to better match the
+        // observed deflection in the game.
+        b *= 0.9;
+
+        // Derive a physically motivated minimum impact parameter based on the
+        // midline scenario described by the user: when the object lies at the
+        // center of the start->Earth baseline (distance d = lenSE), the
+        // required deflection angle is approximated by
+        //
+        //   4b/d ≈ 2 arctan(mu / (b v^2)).
+        //
+        // We solve this equation numerically for b_mid and then use about half
+        // of that value as a lower bound on b, to allow for objects that are
+        // not exactly centered on the baseline.
+        let minB = 0;
+        const dSE = lenSE;
+        if (dSE > 0) {
+            const solveMidlineB = () => {
+                const f = (bTest) => {
+                    if (bTest <= 0) return Number.POSITIVE_INFINITY;
+                    const left = (4 * bTest) / dSE;
+                    const right = 2 * Math.atan(mu / (bTest * vInf * vInf));
+                    return left - right;
+                };
+
+                let bLo = 0.001 * dSE;
+                let bHi = 0.25 * dSE;
+                let fLo = f(bLo);
+                let fHi = f(bHi);
+
+                if (!Number.isFinite(fLo) || !Number.isFinite(fHi) || fLo * fHi > 0) {
+                    return NaN;
+                }
+
+                for (let iter = 0; iter < 40; iter++) {
+                    const bMid = 0.5 * (bLo + bHi);
+                    const fMid = f(bMid);
+                    if (!Number.isFinite(fMid)) {
+                        break;
+                    }
+                    if (Math.abs(fMid) < 1e-3) {
+                        return bMid;
+                    }
+                    if (fLo * fMid <= 0) {
+                        bHi = bMid;
+                        fHi = fMid;
+                    } else {
+                        bLo = bMid;
+                        fLo = fMid;
+                    }
+                }
+                return 0.5 * (bLo + bHi);
+            };
+
+            const bMid = solveMidlineB();
+            if (Number.isFinite(bMid) && bMid > 0) {
+                // Use roughly half the midline solution as requested.
+                minB = 0.5 * bMid;
+            }
+        }
+
+        const schwarzschildRadius = bestObj.getData('schwarzschildRadius') || 0;
+        if (schwarzschildRadius > 0) {
+            // Ensure we do not fly inside the physical body: infer its radius
+            // from the stored Schwarzschild radius.
+            const physRadius = schwarzschildRadius / 1.5;
+            const safeRadius = physRadius * 1.05;
+            if (minB < safeRadius) {
+                minB = safeRadius;
+            }
+        }
+
+        if (minB > 0) {
+            b = Math.max(b, minB);
+        }
+
+        // Construct a line from S that has impact parameter b relative to C.
+        const dxSC = Cx - Sx;
+        const dySC = Cy - Sy;
+        const dSC = Math.sqrt(dxSC * dxSC + dySC * dySC);
+        if (dSC <= b + 1e-3) {
+            // Start is too close for this impact parameter; abort planning.
+            return;
+        }
+
+        const uxSC = dxSC / dSC;
+        const uySC = dySC / dSC;
+        // Perpendicular to S->C
+        const nxSC = -uySC;
+        const nySC = uxSC;
+
+        const h = Math.sqrt(dSC * dSC - b * b);
+
+        const TxLeftX = Sx + uxSC * h + nxSC * b;
+        const TxLeftY = Sy + uySC * h + nySC * b;
+        const TxRightX = Sx + uxSC * h - nxSC * b;
+        const TxRightY = Sy + uySC * h - nySC * b;
+
+        const dLeftX = TxLeftX - Sx;
+        const dLeftY = TxLeftY - Sy;
+        const lenLeft = Math.sqrt(dLeftX * dLeftX + dLeftY * dLeftY);
+        const dRightX = TxRightX - Sx;
+        const dRightY = TxRightY - Sy;
+        const lenRight = Math.sqrt(dRightX * dRightX + dRightY * dRightY);
+
+        if (lenLeft < 1e-3 || lenRight < 1e-3) {
+            return;
+        }
+
+        const uxLeft = dLeftX / lenLeft;
+        const uyLeft = dLeftY / lenLeft;
+        const uxRight = dRightX / lenRight;
+        const uyRight = dRightY / lenRight;
+
+        // Decide which tangent branch to use.
+        // We deviate to the *opposite* side of the baseline start→Earth
+        // direction from where the massive object lies. If the object is on the
+        // right of the green line (as seen from the rocket), we choose the
+        // branch that goes to the left, and vice versa. This corresponds to
+        // the "second choice" described by the user.
+        const baseDx = ux;   // baseline direction S->E
+        const baseDy = uy;
+        const objRx = Cx - Sx;
+        const objRy = Cy - Sy;
+        const objSide = baseDx * objRy - baseDy * objRx; // sign: >0 => object is "left" of baseline
+
+        const sideLeft = baseDx * dLeftY - baseDy * dLeftX;
+        const sideRight = baseDx * dRightY - baseDy * dRightX;
+
+        let dirX = uxLeft;
+        let dirY = uyLeft;
+        let usedLeftBranch = true;
+
+        const sideEps = 1e-5;
+        if (Math.abs(objSide) > sideEps) {
+            // Choose the branch whose side sign is opposite to the object's
+            // side sign relative to the baseline.
+            const leftOpposite = sideLeft * objSide < 0;
+            const rightOpposite = sideRight * objSide < 0;
+
+            if (leftOpposite && !rightOpposite) {
+                dirX = uxLeft;
+                dirY = uyLeft;
+                usedLeftBranch = true;
+            } else if (rightOpposite && !leftOpposite) {
+                dirX = uxRight;
+                dirY = uyRight;
+                usedLeftBranch = false;
+            }
+        } else {
+            const dotLeftOut = uxLeft * doutx + uyLeft * douty;
+            const dotRightOut = uxRight * doutx + uyRight * douty;
+
+            if (dotRightOut > dotLeftOut) {
+                dirX = uxRight;
+                dirY = uyRight;
+                usedLeftBranch = false;
+            }
+        }
+
+        const tangentX = usedLeftBranch ? TxLeftX : TxRightX;
+        const tangentY = usedLeftBranch ? TxLeftY : TxRightY;
+
+        this.slingshotPlan = {
+            startX: Sx,
+            startY: Sy,
+            earthX: Ex,
+            earthY: Ey,
+            baseUx: ux,
+            baseUy: uy,
+            object: bestObj,
+            corridorRadius: bestCorridorRadius,
+            impactParameter: b,
+            deflectionAngle: chi,
+            dirX,
+            dirY,
+            tangentX,
+            tangentY,
+            outDirX: doutx,
+            outDirY: douty,
+            perpDist: bestPerpDist
+        };
+
+        if (this.slingshotPlan && bestObj) {
+            const d = lenSE;
+            let ell = bestT;
+            if (!Number.isFinite(ell)) {
+                ell = 0.5 * d;
+            }
+
+            const minEll = 0.1 * d;
+            const maxEll = 0.9 * d;
+            if (ell < minEll) {
+                ell = minEll;
+            } else if (ell > maxEll) {
+                ell = maxEll;
+            }
+
+            const baseDx = ux;
+            const baseDy = uy;
+            const objRx = Cx - Sx;
+            const objRy = Cy - Sy;
+            const objSide = baseDx * objRy - baseDy * objRx;
+
+            if (Math.abs(objSide) > 1e-6) {
+                const bPerpSign = objSide > 0 ? 1 : -1;
+                const bPerp = bPerpSign * bestPerpDist;
+                const thetaSign = -bPerpSign; // path goes to opposite side of baseline from the mass
+
+                const thetaMax = Phaser.Math.DegToRad(30);
+                let thetaLo = 0;
+                let thetaHi = thetaSign * thetaMax;
+                if (thetaLo > thetaHi) {
+                    const tmp = thetaLo;
+                    thetaLo = thetaHi;
+                    thetaHi = tmp;
+                }
+
+                const mu = bestObj.getData('gravityStrength');
+                const vInf = activeTuningParams.vCruise;
+                if (typeof mu === 'number' && mu > 0 && typeof vInf === 'number' && vInf > 0) {
+                    const bMinAbs = 1e-3;
+
+                    const f = (theta) => {
+                        let bTot = theta * ell + bPerp;
+                        if (Math.abs(bTot) < bMinAbs) {
+                            bTot = (bTot >= 0 ? 1 : -1) * bMinAbs;
+                        }
+                        const chiTheta = 2 * Math.atan(mu / (bTot * vInf * vInf));
+                        return d * theta - (d - ell) * chiTheta;
+                    };
+
+                    let fLo = f(thetaLo);
+                    let fHi = f(thetaHi);
+                    if (Number.isFinite(fLo) && Number.isFinite(fHi) && fLo * fHi <= 0) {
+                        let theta = 0.5 * (thetaLo + thetaHi);
+                        for (let iter = 0; iter < 40; iter++) {
+                            theta = 0.5 * (thetaLo + thetaHi);
+                            const fMid = f(theta);
+                            if (!Number.isFinite(fMid) || Math.abs(fMid) < 1e-4) {
+                                break;
+                            }
+                            if (fLo * fMid <= 0) {
+                                thetaHi = theta;
+                                fHi = fMid;
+                            } else {
+                                thetaLo = theta;
+                                fLo = fMid;
+                            }
+                        }
+
+                        if (Number.isFinite(theta) && Math.abs(theta) > 1e-5) {
+                            let bTot = theta * ell + bPerp;
+                            if (Math.abs(bTot) < bMinAbs) {
+                                bTot = (bTot >= 0 ? 1 : -1) * bMinAbs;
+                            }
+                            const chiTheta = 2 * Math.atan(mu / (bTot * vInf * vInf));
+
+                            const cosT = Math.cos(theta);
+                            const sinT = Math.sin(theta);
+                            const dirInX = cosT * ux - sinT * uy;
+                            const dirInY = sinT * ux + cosT * uy;
+                            const lenDir = Math.sqrt(dirInX * dirInX + dirInY * dirInY) || 1;
+                            const normDirX = dirInX / lenDir;
+                            const normDirY = dirInY / lenDir;
+
+                            const tangentX = Sx + ell * normDirX;
+                            const tangentY = Sy + ell * normDirY;
+
+                            const dxTE = Ex - tangentX;
+                            const dyTE = Ey - tangentY;
+                            const lenTE = Math.sqrt(dxTE * dxTE + dyTE * dyTE) || 1;
+                            const outDirX = dxTE / lenTE;
+                            const outDirY = dyTE / lenTE;
+
+                            // Apply the same simple empirical reduction to the
+                            // stored impact parameter in the refined solution.
+                            const impactParameter = Math.abs(bTot) * 0.9;
+
+                            this.slingshotPlan = {
+                                startX: Sx,
+                                startY: Sy,
+                                earthX: Ex,
+                                earthY: Ey,
+                                baseUx: ux,
+                                baseUy: uy,
+                                object: bestObj,
+                                corridorRadius: bestCorridorRadius,
+                                impactParameter,
+                                deflectionAngle: chiTheta,
+                                dirX: normDirX,
+                                dirY: normDirY,
+                                tangentX,
+                                tangentY,
+                                outDirX,
+                                outDirY,
+                                perpDist: bestPerpDist
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create a graphics layer for debug drawing if not already present
+        this.slingshotDebug = this.add.graphics();
+        this.slingshotDebug.setDepth(500);
+    }
+
+    refineSlingshotPlanNumerically() {
+        // Initialize the incremental numerical sweep state. The actual work is
+        // performed in updateSlingshotSweep() so we can display progress and
+        // avoid blocking the main thread.
+        const plan = this.slingshotPlan;
+        if (!plan) {
+            return;
+        }
+
+        if (!this.gravityObjects || this.gravityObjects.length === 0) {
+            return;
+        }
+
+        // Build a list of massive objects with valid gravity strengths.
+        const masses = this.gravityObjects
+            .map(o => ({ obj: o, mu: o.getData('gravityStrength') }))
+            .filter(m => typeof m.mu === 'number' && m.mu > 0);
+        if (masses.length === 0) {
+            return;
+        }
+
+        const Sx = this.startX;
+        const Sy = this.startY;
+        const Ex = this.earthX;
+        const Ey = this.earthY;
+
+        // Preserve the original green S->E baseline for crossing detection.
+        const dxSE = Ex - Sx;
+        const dySE = Ey - Sy;
+        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
+        if (lenSE < 1e-3) {
+            return;
+        }
+
+        // Use the line from the rocket start to the star as the reference
+        // direction for the sweep, rather than the S->E baseline.
+        const primaryMass = masses[0].obj;
+        const Cx = primaryMass.x;
+        const Cy = primaryMass.y;
+
+        const dxBase = Cx - Sx;
+        const dyBase = Cy - Sy;
+        const lenBase = Math.sqrt(dxBase * dxBase + dyBase * dyBase);
+        if (lenBase < 1e-3) {
+            return;
+        }
+
+        const uxBase = dxBase / lenBase;
+        const uyBase = dyBase / lenBase;
+
+        const vCruise = activeTuningParams.vCruise;
+        if (typeof vCruise !== 'number' || vCruise <= 0) {
+            return;
+        }
+
+        // Set the maximum simulation time so that it is 100 seconds when
+        // vCruise = 100, and scale inversely with cruise speed. Increasing
+        // vCruise by a factor of k reduces maxTime by a factor of 1/k.
+        const refCruise = 100;
+        const baseMaxTimeAtRef = 100; // seconds when vCruise === refCruise
+        const speedScale = vCruise / refCruise;
+        const maxTime = baseMaxTimeAtRef / speedScale;
+
+        // Angle sweep parameters (relative to the start->star line).
+        const maxAngleDeg = 20;
+        const dAngleDeg = 0.1;
+        const maxAngleRad = Phaser.Math.DegToRad(maxAngleDeg);
+        const dAngleRad = Phaser.Math.DegToRad(dAngleDeg);
+
+        const totalSteps = Math.floor((2 * maxAngleRad) / dAngleRad) + 1;
+
+        this.slingshotSweepActive = true;
+        this.slingshotSweepAngle = -maxAngleRad;
+        this.slingshotSweepMaxAngle = maxAngleRad;
+        this.slingshotSweepStep = dAngleRad;
+        this.slingshotSweepBestAngle = null;
+        this.slingshotSweepBestResult = null;
+        this.slingshotSweepBestScore = Number.POSITIVE_INFINITY;
+        this.slingshotSweepTotalSteps = totalSteps;
+        this.slingshotSweepDoneSteps = 0;
+
+        // Cache geometry and parameters for use in updateSlingshotSweep.
+        this.slingshotSweepData = {
+            Sx, Sy, Ex, Ey,
+            dxSE, dySE, lenSE,
+            dxBase, dyBase, lenBase,
+            uxBase, uyBase,
+            vCruise,
+            masses,
+            earthRadius: 80,
+            lineHitThreshold: 0.5 * 80,
+            dt: 0.04,
+            maxTime
+        };
+
+        // Create or update the on-screen sweep status text (bottom of screen).
+        const cam = this.cameras.main;
+        const cx = cam.width / 2;
+        const cy = cam.height - 40;
+        if (!this.slingshotSweepText) {
+            this.slingshotSweepText = this.add.text(cx, cy, 'Computing slingshot...', {
+                fontSize: '20px',
+                fill: '#ff0'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+        } else {
+            this.slingshotSweepText.setText('Computing slingshot...');
+        }
+        this.slingshotSweepText.setVisible(true);
+    }
+
+    updateSlingshotSweep(dtFrame) {
+        if (!this.slingshotSweepActive) {
+            return;
+        }
+
+        const data = this.slingshotSweepData;
+        if (!data) {
+            this.slingshotSweepActive = false;
+            if (this.slingshotSweepText) {
+                this.slingshotSweepText.setVisible(false);
+            }
+            return;
+        }
+
+        const {
+            Sx, Sy, Ex, Ey,
+            dxSE, dySE, lenSE,
+            dxBase, dyBase, lenBase,
+            uxBase, uyBase,
+            vCruise,
+            masses,
+            earthRadius,
+            lineHitThreshold,
+            dt,
+            maxTime
+        } = data;
+
+        const maxSteps = Math.floor(maxTime / dt);
+
+        // Helper to simulate a single trajectory for a given heading angle
+        const simulateForAngle = (angleOffset) => {
+            let x = Sx;
+            let y = Sy;
+            const cosA = Math.cos(angleOffset);
+            const sinA = Math.sin(angleOffset);
+            let vx = vCruise * (uxBase * cosA - uyBase * sinA);
+            let vy = vCruise * (uxBase * sinA + uyBase * cosA);
+
+            // Crossing detection remains relative to the original green S->E
+            // baseline so we can measure distance to Earth where the trajectory
+            // re-crosses that line.
+            const baselineSign = (px, py) => (px - Sx) * dySE - (py - Sy) * dxSE;
+
+            let t = 0;
+            let minDist2 = Number.POSITIVE_INFINITY;
+            let periX = x;
+            let periY = y;
+            let closestObj = null;
+
+            let prevSign = baselineSign(x, y);
+            let crossings = 0;
+            let bestCrossX = null;
+            let bestCrossY = null;
+            let bestDistToEarth = Number.POSITIVE_INFINITY;
+
+            for (let step = 0; step < maxSteps; step++) {
+                // Sum gravity from all massive objects.
+                let ax = 0;
+                let ay = 0;
+                for (const m of masses) {
+                    const Cx = m.obj.x;
+                    const Cy = m.obj.y;
+                    const dxCS = Cx - x;
+                    const dyCS = Cy - y;
+                    const r2 = dxCS * dxCS + dyCS * dyCS;
+                    const r = Math.sqrt(r2);
+                    if (r > 1) {
+                        const g = m.mu / r2;
+                        ax += (dxCS / r) * g;
+                        ay += (dyCS / r) * g;
+                    }
+
+                    // Track closest approach to any mass.
+                    if (r2 < minDist2) {
+                        minDist2 = r2;
+                        periX = x;
+                        periY = y;
+                        closestObj = m.obj;
+                    }
+                }
+
+                vx += ax * dt;
+                vy += ay * dt;
+
+                x += vx * dt;
+                y += vy * dt;
+                t += dt;
+
+                const dxE = x - Ex;
+                const dyE = y - Ey;
+                const distE = Math.sqrt(dxE * dxE + dyE * dyE);
+                if (distE <= earthRadius) {
+                    return {
+                        hit: true,
+                        miss: false,
+                        crossX: x,
+                        crossY: y,
+                        distToEarth: distE,
+                        periX,
+                        periY,
+                        minDistToStar: Math.sqrt(minDist2),
+                        closestObj
+                    };
+                }
+
+                const s = baselineSign(x, y);
+                if (t > dt * 2 && prevSign !== 0 && s !== 0 && Math.sign(s) !== Math.sign(prevSign)) {
+                    crossings++;
+                    const crossX = x;
+                    const crossY = y;
+                    const dCrossE = distE;
+                    if (dCrossE < bestDistToEarth) {
+                        bestDistToEarth = dCrossE;
+                        bestCrossX = crossX;
+                        bestCrossY = crossY;
+                    }
+
+                    if (crossings >= 1 && t > maxTime * 0.25) {
+                        break;
+                    }
+                }
+                prevSign = s;
+            }
+
+            if (bestCrossX !== null) {
+                return {
+                    hit: false,
+                    miss: false,
+                    crossX: bestCrossX,
+                    crossY: bestCrossY,
+                    distToEarth: bestDistToEarth,
+                    periX,
+                    periY,
+                    minDistToStar: Math.sqrt(minDist2),
+                    closestObj
+                };
+            }
+
+            return { hit: false, miss: true };
+        };
+
+        // Process a small number of angles per frame so the UI can update.
+        const anglesPerFrame = 2;
+        for (let i = 0; i < anglesPerFrame && this.slingshotSweepActive; i++) {
+            const angle = this.slingshotSweepAngle;
+            if (angle > this.slingshotSweepMaxAngle + 1e-6) {
+                this.slingshotSweepActive = false;
+                break;
+            }
+
+            const result = simulateForAngle(angle);
+            if (!result.miss) {
+                const score = result.distToEarth;
+                if (score < this.slingshotSweepBestScore) {
+                    this.slingshotSweepBestScore = score;
+                    this.slingshotSweepBestAngle = angle;
+                    this.slingshotSweepBestResult = result;
+                }
+            }
+
+            this.slingshotSweepDoneSteps++;
+            this.slingshotSweepAngle += this.slingshotSweepStep;
+
+            if (this.slingshotSweepAngle > this.slingshotSweepMaxAngle + 1e-6) {
+                this.slingshotSweepActive = false;
+                break;
+            }
+        }
+
+        // Update progress text
+        if (this.slingshotSweepText && this.slingshotSweepActive) {
+            const progress = Math.min(1, this.slingshotSweepDoneSteps / Math.max(1, this.slingshotSweepTotalSteps));
+            const percent = Math.round(progress * 100);
+            this.slingshotSweepText.setText(`Computing slingshot... ${percent}%`);
+        }
+
+        // If the sweep has just finished, finalize the plan.
+        if (!this.slingshotSweepActive) {
+            if (this.slingshotSweepText) {
+                this.slingshotSweepText.setVisible(false);
+            }
+
+            const bestResult = this.slingshotSweepBestResult;
+            const bestAngle = this.slingshotSweepBestAngle;
+            if (!bestResult || bestAngle === null) {
+                // No acceptable numeric trajectory was found in the sweep.
+                if (typeof console !== 'undefined' && console && console.warn) {
+                    console.warn('Slingshot numeric sweep found no viable trajectory. Adjust parameters and try again.');
+                }
+
+                // Show a brief on-screen notification so the user knows why the
+                // run is not proceeding under autopilot.
+                const cam = this.cameras.main;
+                const cx = cam.width / 2;
+                const cy = cam.height - 80;
+                const msg = this.add.text(
+                    cx,
+                    cy,
+                    'No viable slingshot trajectory found. Adjust parameters and restart.',
+                    {
+                        fontSize: '20px',
+                        fill: '#ff8080',
+                        backgroundColor: '#000000'
+                    }
+                ).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+
+                // Fade out the message after a few seconds.
+                this.tweens.add({
+                    targets: msg,
+                    alpha: 0,
+                    duration: 2500,
+                    delay: 1500,
+                    onComplete: () => {
+                        msg.destroy();
+                    }
+                });
+
+                // Ensure autopilot does not proceed with an invalid plan in
+                // this run.
+                if (this.autopilot) {
+                    this.autopilot.enabled = false;
+                }
+
+                return;
+            }
+
+            // Report whether the best trajectory met the line-hit threshold.
+            const accepted = this.slingshotSweepBestScore <= lineHitThreshold;
+            if (typeof console !== 'undefined' && console && console.log) {
+                console.log(
+                    'Slingshot numeric sweep complete. bestScore=',
+                    this.slingshotSweepBestScore,
+                    'threshold=',
+                    lineHitThreshold,
+                    'accepted=',
+                    accepted
+                );
+            }
+
+            const angleOffset = bestAngle;
+            const cosA = Math.cos(angleOffset);
+            const sinA = Math.sin(angleOffset);
+            const dirInX = uxBase * cosA - uyBase * sinA;
+            const dirInY = uxBase * sinA + uyBase * cosA;
+
+            const lenIn = Math.sqrt(dirInX * dirInX + dirInY * dirInY) || 1;
+            const normDirX = dirInX / lenIn;
+            const normDirY = dirInY / lenIn;
+
+            const tangentX = bestResult.periX;
+            const tangentY = bestResult.periY;
+
+            const dxTE = Ex - tangentX;
+            const dyTE = Ey - tangentY;
+            const lenTE = Math.sqrt(dxTE * dxTE + dyTE * dyTE) || 1;
+            const outDirX = dxTE / lenTE;
+            const outDirY = dyTE / lenTE;
+
+            const impactParameter = bestResult.minDistToStar;
+
+            const dotIO = Phaser.Math.Clamp(normDirX * outDirX + normDirY * outDirY, -1, 1);
+            const deflectionAngle = Math.acos(dotIO);
+
+            const plan = this.slingshotPlan;
+            if (!plan) {
+                return;
+            }
+
+            // Use the nearest massive object along the best trajectory as the
+            // representative object for debug visualization.
+            const dominantObj = bestResult.closestObj || null;
+
+            this.slingshotPlan = {
+                startX: Sx,
+                startY: Sy,
+                earthX: Ex,
+                earthY: Ey,
+                baseUx: uxBase,
+                baseUy: uyBase,
+                object: dominantObj,
+                corridorRadius: plan.corridorRadius,
+                impactParameter,
+                deflectionAngle,
+                dirX: normDirX,
+                dirY: normDirY,
+                tangentX,
+                tangentY,
+                outDirX,
+                outDirY,
+                perpDist: plan.perpDist
+            };
+
+            if (this.slingshotDebug) {
+                this.slingshotDebug.destroy();
+                this.slingshotDebug = null;
+            }
+            this.slingshotDebug = this.add.graphics();
+            this.slingshotDebug.setDepth(500);
+        }
+    }
+
+    drawSlingshotDebug() {
+        if (!this.slingshotDebug) {
+            return;
+        }
+
+        const g = this.slingshotDebug;
+        g.clear();
+
+        // Always draw baseline straight path from start to Earth, even if no
+        // slingshot plan exists.
+        const Sx = this.startX;
+        const Sy = this.startY;
+        const Ex = this.earthX;
+        const Ey = this.earthY;
+
+        g.lineStyle(1, 0x00ff00, 0.6);
+        g.beginPath();
+        g.moveTo(Sx, Sy);
+        g.lineTo(Ex, Ey);
+        g.strokePath();
+
+        // If we have a slingshot plan, overlay its details (corridor, impact
+        // circle, and red trajectory) on top of the green baseline.
+        const plan = this.slingshotPlan;
+        if (!plan) {
+            return;
+        }
+
+        const obj = plan.object;
+        if (obj) {
+            const Cx = obj.x;
+            const Cy = obj.y;
+
+            // Draw safety corridor circle around object
+            g.lineStyle(1, 0x00ffff, 0.5);
+            g.strokeCircle(Cx, Cy, plan.corridorRadius);
+
+            // Draw impact parameter circle
+            g.lineStyle(1, 0xff8800, 0.8);
+            g.strokeCircle(Cx, Cy, plan.impactParameter);
+        }
+
+        // Draw planned slingshot trajectory as two straight segments:
+        // 1) Incoming from start to tangent point along the chosen tangent line.
+        // 2) Outgoing from tangent point along the desired post-encounter direction.
+        const Tx = plan.tangentX;
+        const Ty = plan.tangentY;
+
+        // Incoming segment: start -> tangent point
+        g.lineStyle(2, 0xff0000, 0.8);
+        g.beginPath();
+        g.moveTo(Sx, Sy);
+        g.lineTo(Tx, Ty);
+        g.strokePath();
+
+        // Outgoing (deflected) segment: tangent point -> Earth along desired outgoing direction
+        const outEndX = Ex;
+        const outEndY = Ey;
+        g.lineStyle(2, 0xff4444, 0.8);
+        g.beginPath();
+        g.moveTo(Tx, Ty);
+        g.lineTo(outEndX, outEndY);
+        g.strokePath();
+    }
+
+    createUI() {
+        // Stats display
+        this.statsText = this.add.text(10, 10, '', {
+            fontSize: '18px',
+            fill: '#0f0',
+            backgroundColor: '#000a',
+            padding: { x: 10, y: 5 }
+        });
+        this.statsText.setScrollFactor(0);
+        this.statsText.setDepth(1000);
+        
+        // Instructions
+        this.add.text(
+            600,
+            10,
+            'Arrow Keys: Move   |   Space: Shoot\n' +
+            'Navigate to Earth in the least possible time.\n' +
+            'Avoid excessive time dilation.\n' +
+            'Avoid or shoot down asteroids.\n' +
+            'Land on Earth nose-up at low speed with the correct orientation.',
+            {
+                fontSize: '16px',
+                fill: '#fff',
+                backgroundColor: '#000a',
+                padding: { x: 10, y: 5 }
+            }
+        ).setOrigin(0.5, 0).setScrollFactor(0).setDepth(1000);
+        
+        // Radar
+        this.radar = this.add.graphics();
+        this.radar.setScrollFactor(0);
+        this.radar.setDepth(1000);
+    }
+
+    createStartMenu() {
+        const w = this.cameras.main.width;
+        const h = this.cameras.main.height;
+        const centerX = w / 2;
+        const centerY = h / 2;
+
+        const bg = this.add.rectangle(centerX, centerY, 520, 360, 0x000000, 0.8)
+            .setScrollFactor(0)
+            .setDepth(3000);
+
+        const title = this.add.text(centerX, centerY - 140, 'Mode Select', {
+            fontSize: '32px',
+            fill: '#0ff'
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(3001);
+
+        const elements = [bg, title];
+
+        // World feature toggles
+        const checkboxLabels = [
+            {
+                text: 'Massive objects (suns, black holes)',
+                key: 'massive',
+                getter: () => globalEnableMassiveObjects,
+                setter: (v) => { globalEnableMassiveObjects = v; }
+            },
+            {
+                text: 'Asteroids',
+                key: 'asteroids',
+                getter: () => globalEnableAsteroids,
+                setter: (v) => { globalEnableAsteroids = v; }
+            },
+            {
+                text: 'Tokens (fuel & ammo pickups)',
+                key: 'tokens',
+                getter: () => globalEnableTokens,
+                setter: (v) => { globalEnableTokens = v; }
+            }
+        ];
+
+        checkboxLabels.forEach((cfg, idx) => {
+            const y = centerY - 70 + idx * 24;
+            const box = this.add.rectangle(centerX - 210, y, 18, 18, 0x001122, 1.0)
+                .setScrollFactor(0)
+                .setDepth(3001)
+                .setStrokeStyle(1, 0x00ffff)
+                .setInteractive({ useHandCursor: true });
+
+            const checkText = this.add.text(centerX - 210, y, cfg.getter() ? '✔' : '', {
+                fontSize: '16px',
+                fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+
+            const label = this.add.text(centerX - 190, y, cfg.text, {
+                fontSize: '16px',
+                fill: '#0ff'
+            }).setOrigin(0, 0.5).setScrollFactor(0).setDepth(3002);
+
+            const toggle = () => {
+                const current = cfg.getter();
+                const next = !current;
+                cfg.setter(next);
+                checkText.setText(next ? '✔' : '');
+            };
+
+            box.on('pointerdown', toggle);
+            label.setInteractive({ useHandCursor: true }).on('pointerdown', toggle);
+
+            elements.push(box, checkText, label);
+        });
+
+        const makeButton = (label, offsetY, handler) => {
+            const btnBg = this.add.rectangle(centerX, centerY + offsetY, 260, 40, 0x003344, 0.9)
+                .setScrollFactor(0)
+                .setDepth(3001)
+                .setInteractive({ useHandCursor: true });
+            const btnText = this.add.text(centerX, centerY + offsetY, label, {
+                fontSize: '20px',
+                fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+            btnBg.on('pointerdown', handler);
+            elements.push(btnBg, btnText);
+            return { btnBg, btnText };
+        };
+
+        const btnTest = makeButton('Test (90-run experiment)', -10, () => {
+            globalMode = 'TEST';
+            experimentConfig.enabled = true;
+            experimentConfig.successes.fill(0);
+            experimentConfig.attempts.fill(0);
+            experimentConfig.angleIndex = 0;
+            experimentConfig.trialIndex = 0;
+            experimentConfig.finished = false;
+            elements.forEach(e => e.destroy());
+            this.scene.restart();
+        });
+
+        const btnAuto = makeButton('Autopilot', 50, () => {
+            globalMode = 'AUTOPILOT';
+            experimentConfig.enabled = false;
+            elements.forEach(e => e.destroy());
+            this.scene.restart();
+        });
+
+        const btnManual = makeButton('Manual', 110, () => {
+            globalMode = 'MANUAL';
+            experimentConfig.enabled = false;
+            elements.forEach(e => e.destroy());
+            this.scene.restart();
+        });
+
+        const btnTuning = makeButton('Tuning (adjust parameters)', 170, () => {
+            globalMode = 'MENU';
+            elements.forEach(e => e.destroy());
+            this.showTuningScreen();
+        });
+    }
+
+    showTuningScreen() {
+        const w = this.cameras.main.width;
+        const h = this.cameras.main.height;
+        const centerX = w / 2;
+        const centerY = h / 2;
+
+        const bg = this.add.rectangle(centerX, centerY, 700, 500, 0x000000, 0.9)
+            .setScrollFactor(0)
+            .setDepth(3000);
+
+        const title = this.add.text(centerX, centerY - 210, 'Tuning Parameters', {
+            fontSize: '26px',
+            fill: '#0ff'
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(3001);
+
+        const paramRows = [];
+        tuningParamsDefinition.forEach((def, idx) => {
+            const y = centerY - 150 + idx * 25;
+
+            const labelText = this.add.text(centerX - 260, y, def.label + ':', {
+                fontSize: '16px',
+                fill: '#0ff'
+            }).setOrigin(0, 0.5).setScrollFactor(0).setDepth(3001);
+
+            const valueText = this.add.text(centerX + 10, y, '', {
+                fontSize: '16px',
+                fill: '#0f0'
+            }).setOrigin(0, 0.5).setScrollFactor(0).setDepth(3001);
+
+            // DOM input for new value
+            const input = this.add.dom(centerX + 210, y).createFromHTML(
+                `<input type="text" style="width:80px; font-size:14px;" />`
+            );
+            input.setOrigin(0.5, 0.5);
+            input.setScrollFactor(0);
+            input.setDepth(3001);
+
+            // Update button
+            const btnBg = this.add.rectangle(centerX + 310, y, 60, 24, 0x003344, 0.9)
+                .setScrollFactor(0)
+                .setDepth(3001)
+                .setInteractive({ useHandCursor: true });
+            const btnText = this.add.text(centerX + 310, y, 'Set', {
+                fontSize: '14px',
+                fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+
+            btnBg.on('pointerdown', () => {
+                const el = input.node && input.node.querySelector('input');
+                if (!el) return;
+                const raw = el.value.trim();
+                if (!raw) return;
+                const num = parseFloat(raw);
+                if (Number.isNaN(num)) return;
+                let clamped = num;
+                if (typeof def.min === 'number') clamped = Math.max(clamped, def.min);
+                if (typeof def.max === 'number') clamped = Math.min(clamped, def.max);
+                activeTuningParams[def.key] = clamped;
+                el.value = '';
+                updateValueTexts();
+                saveTuningToStorage();
+            });
+
+            paramRows.push({ def, labelText, valueText, input, btnBg, btnText });
+        });
+
+        const updateValueTexts = () => {
+            paramRows.forEach(entry => {
+                const def = entry.def;
+                const v = activeTuningParams[def.key];
+                entry.valueText.setText(v.toFixed(def.decimals));
+            });
+        };
+        updateValueTexts();
+
+        const hint = this.add.text(
+            centerX,
+            centerY + 140,
+            'Parameters currently match active tuning.',
+            {
+                fontSize: '14px',
+                fill: '#ccc',
+                align: 'center'
+            }
+        ).setOrigin(0.5).setScrollFactor(0).setDepth(3001);
+
+        const makeButton = (label, y, handler) => {
+            const btnBg = this.add.rectangle(centerX, y, 220, 40, 0x003344, 0.9)
+                .setScrollFactor(0)
+                .setDepth(3001)
+                .setInteractive({ useHandCursor: true });
+            const btnText = this.add.text(centerX, y, label, {
+                fontSize: '20px',
+                fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+            btnBg.on('pointerdown', handler);
+            return { btnBg, btnText };
+        };
+
+        const lastRow = paramRows[paramRows.length - 1];
+        const backY = lastRow ? lastRow.labelText.y + 50 : centerY + 200;
+        const btnBack = makeButton('Back to Menu', backY, () => {
+            bg.destroy();
+            title.destroy();
+            hint.destroy();
+            paramRows.forEach(p => {
+                p.labelText.destroy();
+                p.valueText.destroy();
+                if (p.input) p.input.destroy();
+                p.btnBg.destroy();
+                p.btnText.destroy();
+            });
+            btnBack.btnBg.destroy();
+            btnBack.btnText.destroy();
+
+            globalMode = 'MENU';
+            experimentConfig.enabled = false;
+            this.scene.restart();
+        });
+    }
+
+    update(time, delta) {
+        if (this.gameOver) return;
+        // Keep instance mode in sync with global mode (except during TEST runs)
+        if (!experimentConfig.enabled) {
+            this.mode = globalMode;
+        }
+        
+        // Toggle autopilot only in MANUAL mode
+        if (!experimentConfig.enabled && this.mode === 'MANUAL') {
+            if (Phaser.Input.Keyboard.JustDown(this.autopilotKey)) {
+                this.autopilot.enabled = !this.autopilot.enabled;
+                console.log('Autopilot:', this.autopilot.enabled ? 'ENABLED' : 'DISABLED');
+            }
+        }
+        
+        // Draw background
+        this.drawBackground();
+        
+        // For AUTOPILOT and TEST modes, run the numerical slingshot sweep
+        // first (if applicable), then enable and update autopilot.
+        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST') {
+            this.updateSlingshotSweep(delta / 1000);
+            // Enable autopilot only once the sweep has finished.
+            if (!this.slingshotSweepActive) {
+                this.autopilot.enabled = true;
+            } else {
+                this.autopilot.enabled = false;
+            }
+        }
+
+        // Update autopilot (if enabled, it will override manual controls)
+        if (this.autopilot.enabled) {
+            this.autopilot.update(delta / 1000);
+        }
+        
+        // Handle input (manual controls, ignored if autopilot active)
+        if (!this.autopilot.enabled) {
+            this.handleInput(delta);
+        }
+        
+        // Apply gravity
+        this.applyGravity(delta);
+        
+        // Update time
+        this.updateTime(delta);
+        
+        // Redraw ship visuals aligned with physics body & angle
+        this.drawShip();
+        
+        // Draw slingshot planning debug overlay (if any)
+        this.drawSlingshotDebug();
+        
+        // Update gravity object glows
+        this.gravityObjects.forEach(obj => {
+            const glow = obj.getData('glow');
+            if (glow) {
+                glow.x = obj.x;
+                glow.y = obj.y;
+            }
+        });
+        
+        // Update UI
+        this.updateUI();
+        
+        // Update bullets
+        this.updateBullets(delta);
+    }
+
+    drawShip() {
+        if (!this.shipBody) return;
+        this.shipBody.clear();
+
+        // Move ship body to physics position
+        this.shipBody.x = this.player.x;
+        this.shipBody.y = this.player.y;
+
+        // Main hull - pointed along +X
+        this.shipBody.fillStyle(0x00ffff, 1);
+        this.shipBody.beginPath();
+        this.shipBody.moveTo(22, 0);      // nose
+        this.shipBody.lineTo(-14, -9);    // rear top
+        this.shipBody.lineTo(-14, 9);     // rear bottom
+        this.shipBody.closePath();
+        this.shipBody.fillPath();
+
+        // Cockpit
+        this.shipBody.fillStyle(0x0088aa, 1);
+        this.shipBody.fillTriangle(0, -5, 0, 5, 8, 0);
+
+        // Outline
+        this.shipBody.lineStyle(2, 0xffffff, 1);
+        this.shipBody.strokeTriangle(22, 0, -14, -9, -14, 9);
+
+        // Engine glow
+        this.shipBody.fillStyle(0xffaa00, 0.8);
+        this.shipBody.fillEllipse(-18, 0, 6, 10);
+
+        // Thrust flame when accelerating
+        if (this.isThrusting) {
+            this.shipBody.fillStyle(0xff6600, 1);
+            this.shipBody.beginPath();
+            this.shipBody.moveTo(-14, -7);
+            this.shipBody.lineTo(-26, 0);
+            this.shipBody.lineTo(-14, 7);
+            this.shipBody.closePath();
+            this.shipBody.fillPath();
+        }
+
+        // Side thruster flames (in ship-local frame before rotation)
+        if (this.sideThrustLeft) {
+            this.shipBody.fillStyle(0xffcc00, 1);
+            this.shipBody.beginPath();
+            this.shipBody.moveTo(-2, 9);
+            this.shipBody.lineTo(-2, 15);
+            this.shipBody.lineTo(4, 9);
+            this.shipBody.closePath();
+            this.shipBody.fillPath();
+        }
+
+        if (this.sideThrustRight) {
+            this.shipBody.fillStyle(0xffcc00, 1);
+            this.shipBody.beginPath();
+            this.shipBody.moveTo(-2, -9);
+            this.shipBody.lineTo(-2, -15);
+            this.shipBody.lineTo(4, -9);
+            this.shipBody.closePath();
+            this.shipBody.fillPath();
+        }
+
+        // Apply rotation based on current ship angle
+        this.shipBody.rotation = this.playerAngle;
+    }
+
+    drawBackground() {
+        this.bg.clear();
+        this.bgStars.forEach(star => {
+            this.bg.fillStyle(0xffffff, star.alpha);
+            this.bg.fillCircle(star.x, star.y, star.size);
+        });
+    }
+
+    handleInput(delta) {
+        const dt = delta / 1000;
+        
+        // Rotation
+        const angularAccel = 4.0;
+        if (this.cursors.left.isDown) {
+            this.angularVelocity -= angularAccel * dt;
+        }
+        if (this.cursors.right.isDown) {
+            this.angularVelocity += angularAccel * dt;
+        }
+        const maxAngularSpeed = 4.0;
+        this.angularVelocity = Phaser.Math.Clamp(this.angularVelocity, -maxAngularSpeed, maxAngularSpeed);
+
+        this.playerAngle += this.angularVelocity * dt;
+        
+        // Thrust (manual main engine) with fuel consumption
+        if (this.cursors.up.isDown && this.fuel > 0) {
+            const thrustMag = 150;
+            const thrustX = Math.cos(this.playerAngle) * thrustMag;
+            const thrustY = Math.sin(this.playerAngle) * thrustMag;
+            this.player.body.setAcceleration(thrustX, thrustY);
+            this.isThrusting = true;
+
+            const mainFuelRate = 0.015; // keep consistent with autopilot
+            const fuelUse = thrustMag * dt * mainFuelRate;
+            this.fuel = Math.max(0, this.fuel - fuelUse);
+        } else {
+            this.player.body.setAcceleration(0, 0);
+            this.isThrusting = false;
+        }
+        
+        // Shoot
+        if (Phaser.Input.Keyboard.JustDown(this.spaceKey) && this.ammo > 0) {
+            this.shoot();
+        }
+    }
+
+    shoot() {
+        const bulletX = this.player.x + Math.cos(this.playerAngle) * 25;
+        const bulletY = this.player.y + Math.sin(this.playerAngle) * 25;
+        
+        const bullet = this.add.circle(bulletX, bulletY, 6, 0xffff00);
+        bullet.setStrokeStyle(3, 0xffffff);
+        
+        const speed = 600;
+        bullet.vx = Math.cos(this.playerAngle) * speed + this.player.body.velocity.x;
+        bullet.vy = Math.sin(this.playerAngle) * speed + this.player.body.velocity.y;
+        const bulletMass = 1;
+        const shipMass = 50;
+        const recoilFactor = bulletMass / shipMass;
+        this.player.body.velocity.x -= Math.cos(this.playerAngle) * speed * recoilFactor;
+        this.player.body.velocity.y -= Math.sin(this.playerAngle) * speed * recoilFactor;
+        
+        this.bullets.add(bullet);
+        this.ammo -= 1;
+        
+        // Auto-destroy after 3 seconds
+        this.time.delayedCall(3000, () => {
+            if (bullet.active) bullet.destroy();
+        });
+    }
+
+    applyGravity(delta) {
+        // Gravity from stars / black holes
+        this.gravityObjects.forEach(obj => {
+            const dx = obj.x - this.player.x;
+            const dy = obj.y - this.player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist > 1) {
+                const gravityStrength = obj.getData('gravityStrength');
+                const schwarzschildRadius = obj.getData('schwarzschildRadius');
+                
+                let force = gravityStrength / (dist * dist);
+                
+                // Increase force dramatically when close
+                if (dist < schwarzschildRadius) {
+                }
+                
+                const forceX = (dx / dist) * force;
+                const forceY = (dy / dist) * force;
+                
+                this.player.body.velocity.x += forceX * (delta / 1000);
+                this.player.body.velocity.y += forceY * (delta / 1000);
+            }
+        });
+
+        // Gravity pull from Earth to make capture/landing realistic and decisive
+        if (this.earth) {
+            const dxE = this.earth.x - this.player.x;
+            const dyE = this.earth.y - this.player.y;
+            const distE = Math.sqrt(dxE * dxE + dyE * dyE);
+            if (distE > 1) {
+                const earthGravityStrength = 0; // still weaker than most stars/black holes but strong enough to pull us in
+                const gE = earthGravityStrength / (distE * distE);
+                const fxE = (dxE / distE) * gE;
+                const fyE = (dyE / distE) * gE;
+                this.player.body.velocity.x += fxE * (delta / 1000);
+                this.player.body.velocity.y += fyE * (delta / 1000);
+            }
+        }
+    }
+
+    updateTime(delta) {
+        let gravitationalPotential = 0;
+        
+        this.gravityObjects.forEach(obj => {
+            const dx = obj.x - this.player.x;
+            const dy = obj.y - this.player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const mass = obj.getData('mass');
+            const schwarzschildRadius = obj.getData('schwarzschildRadius');
+            
+            const potential = mass / Math.max(dist, schwarzschildRadius * 0.5);
+            gravitationalPotential += potential;
+        });
+        
+        // Clamp gravitational potential to avoid extreme values
+        gravitationalPotential = Math.min(gravitationalPotential, 200000);
+        let gravitationalDilation = 1 / Math.sqrt(1 + gravitationalPotential / 50000);
+        if (!Number.isFinite(gravitationalDilation) || gravitationalDilation <= 0) {
+            gravitationalDilation = 0.1;
+        }
+        
+        const speed = Math.sqrt(
+            this.player.body.velocity.x ** 2 + 
+            this.player.body.velocity.y ** 2
+        );
+        const c = 800;
+        let beta2 = (speed / c) * (speed / c);
+        if (!Number.isFinite(beta2) || beta2 < 0) {
+            beta2 = 0;
+        }
+        beta2 = Math.min(beta2, 0.99);
+        const velocityDilation = Math.sqrt(1 - beta2);
+        
+        const timeDilation = Math.max(0.05, gravitationalDilation * velocityDilation);
+        
+        this.shipTime += (delta / 1000) * timeDilation;
+        this.earthTime += delta / 1000;
+    }
+
+    updateUI() {
+        const distToEarth = Phaser.Math.Distance.Between(
+            this.player.x, this.player.y,
+            this.earth.x, this.earth.y
+        );
+
+        // Compute radial/tangential velocity components relative to Earth
+        const vx = this.player.body.velocity.x;
+        const vy = this.player.body.velocity.y;
+        const dx = this.player.x - this.earth.x;
+        const dy = this.player.y - this.earth.y;
+
+        let radialV = 0;
+        let tangentialV = 0;
+        if (distToEarth > 1e-3) {
+            const rx = dx / distToEarth;
+            const ry = dy / distToEarth;
+            radialV = vx * rx + vy * ry;
+            const vtX = vx - radialV * rx;
+            const vtY = vy - radialV * ry;
+            const tx = -ry;
+            const ty = rx;
+            tangentialV = vtX * tx + vtY * ty;
+        }
+
+        // Attitude error relative to Earthward (radial inward) direction
+        const bearingToEarth = Math.atan2(
+            this.earth.y - this.player.y,
+            this.earth.x - this.player.x
+        );
+        const attitudeErrorRad = Phaser.Math.Angle.Wrap(bearingToEarth - this.playerAngle);
+        const attitudeErrorDeg = Phaser.Math.RadToDeg(attitudeErrorRad);
+
+        const lines = [
+            `Fuel: ${Math.max(0, this.fuel).toFixed(1)}`,
+            `Ammo: ${this.ammo}`,
+            `Ship Time: ${this.shipTime.toFixed(1)}s`,
+            `Earth Time: ${this.earthTime.toFixed(1)}s`,
+            `Distance: ${distToEarth.toFixed(0)}`,
+            `v_r: ${radialV.toFixed(2)}`,
+            `v_tan: ${tangentialV.toFixed(2)}`,
+            `AttitudeErr: ${attitudeErrorDeg.toFixed(1)}°`
+        ];
+
+        if (typeof bestEarthTime === 'number') {
+            lines.push(`Best Earth Time: ${bestEarthTime.toFixed(1)}s`);
+        } else {
+            lines.push('Best Earth Time: --');
+        }
+        
+        // Autopilot status
+        if (this.autopilot.enabled) {
+            lines.push(`Autopilot: ON [${this.autopilot.getPhaseString()}]`);
+        } else {
+            lines.push('Autopilot: OFF (Press A)');
+        }
+
+        this.statsText.setText(lines);
+
+        // Clear HUD graphics before drawing overlays
+        if (this.radar) {
+            this.radar.clear();
+        }
+
+        // Draw autopilot control indicators
+        if (this.autopilot.enabled) {
+            this.drawAutopilotControls();
+        }
+        
+        // Draw radar
+        this.drawRadar();
+    }
+    
+    drawAutopilotControls() {
+        try {
+            // Use cached control state from last update
+            const control = this.autopilot.lastControl;
+            if (!control || !this.radar) return;
+            
+            const indicatorX = 100;
+            const indicatorY = 700;
+            const arrowSize = 30;
+            
+            // Draw control panel background
+            this.radar.fillStyle(0x000000, 0.5);
+            this.radar.fillRect(indicatorX - 50, indicatorY - 50, 200, 100);
+            this.radar.lineStyle(2, 0x00ffff, 1);
+            this.radar.strokeRect(indicatorX - 50, indicatorY - 50, 200, 100);
+            
+            // Draw rotation arrows
+            if (control.angularControl < -0.1) {
+                // Left arrow (turning left)
+                this.radar.fillStyle(0xffff00, 1);
+                this.radar.fillTriangle(
+                    indicatorX - arrowSize, indicatorY,
+                    indicatorX, indicatorY - arrowSize/2,
+                    indicatorX, indicatorY + arrowSize/2
+                );
+            } else if (control.angularControl > 0.1) {
+                // Right arrow (turning right)
+                this.radar.fillStyle(0xffff00, 1);
+                this.radar.fillTriangle(
+                    indicatorX + arrowSize, indicatorY,
+                    indicatorX, indicatorY - arrowSize/2,
+                    indicatorX, indicatorY + arrowSize/2
+                );
+            }
+            
+            // Draw thrust indicator
+            if (control.thrust) {
+                this.radar.fillStyle(0xff6600, 1);
+                this.radar.fillTriangle(
+                    indicatorX + 80, indicatorY - 20,
+                    indicatorX + 80, indicatorY + 20,
+                    indicatorX + 120, indicatorY
+                );
+            }
+        } catch (error) {
+            console.error('Error drawing autopilot controls:', error);
+        }
+    }
+
+    drawRadar() {
+        const radarX = 1050;
+        const radarY = 650;
+        const radarSize = 140;
+        const radarRadius = radarSize / 2;
+        // Local radar range in world units: ~4x the larger screen dimension.
+        // For 1200x800 this is 2 * max(1200, 800) = 2400.
+        const width = this.cameras.main.width;
+        const height = this.cameras.main.height;
+        const radarRange = 1.5 * Math.max(width, height);
+        
+        this.radar.clear();
+        
+        // Background
+        this.radar.fillStyle(0x000000, 0.7);
+        this.radar.fillCircle(radarX, radarY, radarRadius);
+        
+        // Border
+        this.radar.lineStyle(2, 0x00ff00, 0.8);
+        this.radar.strokeCircle(radarX, radarY, radarRadius);
+        
+        // Player (center)
+        this.radar.fillStyle(0x00ffff, 1);
+        this.radar.fillCircle(radarX, radarY, 4);
+
+        const step = Math.PI / 18; // ~10 degrees
+        const radiusEdge = radarRadius - 6;
+
+        // Helper to draw a local radar marker: only if within radarRange, and
+        // positioned proportionally to distance from the player.
+        const drawLocalMarker = (tx, ty, color, size = 4) => {
+            const dx = tx - this.player.x;
+            const dy = ty - this.player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > radarRange) return; // Too far: not shown on local radar
+
+            const angle = Math.atan2(dy, dx);
+            const quantizedAngle = Math.round(angle / step) * step;
+            // Map distance [0, radarRange] -> [0, radiusEdge]
+            const r = (dist / radarRange) * radiusEdge;
+            const mx = radarX + Math.cos(quantizedAngle) * r;
+            const my = radarY + Math.sin(quantizedAngle) * r;
+            this.radar.fillStyle(color, 1);
+            this.radar.fillCircle(mx, my, size);
+        };
+
+        // Earth direction arrow (always same length, only angle matters)
+        const dxEarth = this.earth.x - this.player.x;
+        const dyEarth = this.earth.y - this.player.y;
+        const distEarth = Math.sqrt(dxEarth * dxEarth + dyEarth * dyEarth);
+        const angleToEarth = Math.atan2(dyEarth, dxEarth);
+        const quantizedAngle = Math.round(angleToEarth / step) * step;
+
+        // Local Earth marker when within radar range
+        if (distEarth <= radarRange) {
+            drawLocalMarker(this.earth.x, this.earth.y, 0x0088ff, 5);
+        }
+
+        // Earth marker: global direction only (not distance-limited)
+        if (distEarth > radarRange) {
+            this.radar.lineStyle(3, 0x00aaff, 0.6);
+            this.radar.lineBetween(
+                radarX,
+                radarY,
+                radarX + Math.cos(quantizedAngle) * radiusEdge,
+                radarY + Math.sin(quantizedAngle) * radiusEdge
+            );
+            const earthMarkerX = radarX + Math.cos(quantizedAngle) * radiusEdge;
+            const earthMarkerY = radarY + Math.sin(quantizedAngle) * radiusEdge;
+            this.radar.fillStyle(0x00aaff, 1);
+            this.radar.fillCircle(earthMarkerX, earthMarkerY, 4);
+        }
+
+        // Gravity objects (stars / black holes)
+        this.gravityObjects.forEach(obj => {
+            const isStar = obj.getData('isStar');
+            const color = isStar ? 0xffff00 : 0xaa00ff;
+            drawLocalMarker(obj.x, obj.y, color, 3);
+        });
+
+        // Asteroids
+        this.asteroids.children.entries.forEach(asteroid => {
+            if (!asteroid.active) return;
+            drawLocalMarker(asteroid.x, asteroid.y, 0xaaaaaa, 2);
+        });
+
+        // Fuel pickups
+        this.fuelPickups.children.entries.forEach(fuel => {
+            if (!fuel.active) return;
+            drawLocalMarker(fuel.x, fuel.y, 0x00ff00, 3);
+        });
+
+        // Ammo pickups
+        this.ammoPickups.children.entries.forEach(ammo => {
+            if (!ammo.active) return;
+            drawLocalMarker(ammo.x, ammo.y, 0xff6600, 3);
+        });
+    }
+
+    updateBullets(delta) {
+        const dt = delta / 1000;
+        this.bullets.children.entries.forEach(bullet => {
+            if (!bullet || !bullet.active) return;
+
+            // Integrate bullet motion manually
+            if (typeof bullet.vx === 'number' && typeof bullet.vy === 'number') {
+                bullet.x += bullet.vx * dt;
+                bullet.y += bullet.vy * dt;
+            }
+            
+            // Check asteroid collisions
+            this.asteroids.children.entries.forEach(asteroid => {
+                if (!asteroid || !asteroid.active) return;
+                
+                const dist = Phaser.Math.Distance.Between(
+                    bullet.x, bullet.y,
+                    asteroid.x, asteroid.y
+                );
+                
+                if (dist < asteroid.body.radius + 5) {
+                    bullet.destroy();
+                    asteroid.destroy();
+                }
+            });
+            
+            // Destroy if out of bounds
+            if (bullet.x < 0 || bullet.x > this.worldWidth || 
+                bullet.y < 0 || bullet.y > this.worldHeight) {
+                bullet.destroy();
+            }
+        });
+    }
+
+    collectFuel(player, fuel) {
+        fuel.destroy();
+        this.fuel = Math.min(this.fuel + 30, 100);
+    }
+
+    collectAmmo(player, ammo) {
+        ammo.destroy();
+        this.ammo = Math.min(this.ammo + 20, 50);
+    }
+
+    loseGame() {
+        if (this.gameOver) return;
+        this.gameOver = true;
+
+        // Record experiment failure if enabled
+        if (experimentConfig.enabled && !experimentConfig.finished) {
+            const idx = experimentConfig.angleIndex;
+            experimentConfig.attempts[idx]++;
+            // Show a quick failure indicator for TEST runs
+            const cam = this.cameras.main;
+            const failText = this.add.text(cam.width / 2, cam.height / 2, '✗', {
+                fontSize: '72px',
+                fill: '#f00'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(2500);
+            this.tweens.add({
+                targets: failText,
+                alpha: 0,
+                duration: 250,
+                onComplete: () => failText.destroy()
+            });
+            this.advanceExperimentTrial();
+            return;
+        }
+
+        this.player.body.setVelocity(0, 0);
+        
+        const msg = this.add.text(600, 400, 'COLLISION!\n\nPress R to Restart', {
+            fontSize: '48px',
+            fill: '#f00',
+            align: 'center',
+            backgroundColor: '#000c',
+            padding: { x: 20, y: 10 }
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(2000);
+        
+        const restartKey = this.input.keyboard.addKey('R');
+        restartKey.once('down', () => {
+            this.scene.restart();
+        });
+    }
+
+    winGame() {
+        if (this.gameOver) return;
+        const vx = this.player.body.velocity.x;
+        const vy = this.player.body.velocity.y;
+        const speed = Math.sqrt(vx * vx + vy * vy);
+
+        const angleToEarth = Math.atan2(
+            this.earth.y - this.player.y,
+            this.earth.x - this.player.x
+        );
+        const thrusterAngle = this.playerAngle + Math.PI;
+        let angleDiff = Phaser.Math.Angle.Wrap(thrusterAngle - angleToEarth);
+        angleDiff = Math.abs(angleDiff);
+
+        const maxLandingSpeed = 100;
+        const maxLandingAngle = Phaser.Math.DegToRad(10);
+
+        if (speed > maxLandingSpeed || angleDiff > maxLandingAngle) {
+            this.loseGame();
+            return;
+        }
+
+        this.gameOver = true;
+
+        // Record experiment success if enabled
+        if (experimentConfig.enabled && !experimentConfig.finished) {
+            const idx = experimentConfig.angleIndex;
+            experimentConfig.attempts[idx]++;
+            experimentConfig.successes[idx]++;
+            // Show a quick success indicator for TEST runs
+            const cam = this.cameras.main;
+            const successText = this.add.text(cam.width / 2, cam.height / 2, '✓', {
+                fontSize: '72px',
+                fill: '#0f0'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(2500);
+            this.tweens.add({
+                targets: successText,
+                alpha: 0,
+                duration: 250,
+                onComplete: () => successText.destroy()
+            });
+            this.advanceExperimentTrial();
+            return;
+        }
+        
+        this.player.body.setVelocity(0, 0);
+        
+        const timeLost = this.earthTime - this.shipTime;
+
+        let isNewBest = false;
+        if (bestEarthTime === null || this.earthTime < bestEarthTime) {
+            bestEarthTime = this.earthTime;
+            isNewBest = true;
+        }
+
+        let bestLine = '';
+        if (typeof bestEarthTime === 'number') {
+            bestLine = `Best Earth Time: ${bestEarthTime.toFixed(1)}s`;
+            if (isNewBest) {
+                bestLine += ' (NEW RECORD)';
+            }
+        }
+
+        const messageLines = [
+            `EARTH REACHED!`,
+            '',
+            `Earth Time: ${this.earthTime.toFixed(1)}s`,
+            `Ship Time: ${this.shipTime.toFixed(1)}s`,
+            `Time Lost: ${timeLost.toFixed(1)}s`
+        ];
+        if (bestLine) {
+            messageLines.push('', bestLine);
+        }
+        messageLines.push('', 'Press R to Restart');
+
+        const msg = this.add.text(600, 400, messageLines.join('\n'), {
+            fontSize: '32px',
+            fill: '#0f0',
+            align: 'center',
+            backgroundColor: '#000c',
+            padding: { x: 20, y: 10 }
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(2000);
+        
+        const restartKey = this.input.keyboard.addKey('R');
+        restartKey.once('down', () => {
+            this.scene.restart();
+        });
+    }
+
+    advanceExperimentTrial() {
+        const angles = experimentConfig.anglesDeg;
+        const trialsPerAngle = experimentConfig.trialsPerAngle;
+
+        experimentConfig.trialIndex++;
+        if (experimentConfig.trialIndex >= trialsPerAngle) {
+            experimentConfig.trialIndex = 0;
+            experimentConfig.angleIndex++;
+        }
+
+        if (experimentConfig.angleIndex >= angles.length) {
+            experimentConfig.finished = true;
+            this.showExperimentResults();
+            return;
+        }
+
+        this.scene.restart();
+    }
+
+    showExperimentResults() {
+        const lines = ['Experiment results (success rate vs angle):'];
+        for (let i = 0; i < experimentConfig.anglesDeg.length; i++) {
+            const angle = experimentConfig.anglesDeg[i];
+            const attempts = experimentConfig.attempts[i];
+            const successes = experimentConfig.successes[i];
+            const rate = attempts > 0 ? (successes / attempts) : 0;
+            lines.push(
+                `${angle.toFixed(0)}°: ${successes}/${attempts} ` +
+                `(${(rate * 100).toFixed(0)}%)`
+            );
+        }
+
+        // Overall success statistics
+        let totalAttempts = 0;
+        let totalSuccesses = 0;
+        for (let i = 0; i < experimentConfig.anglesDeg.length; i++) {
+            totalAttempts += experimentConfig.attempts[i];
+            totalSuccesses += experimentConfig.successes[i];
+        }
+        const overallRate = totalAttempts > 0 ? (totalSuccesses / totalAttempts) : 0;
+        const overallPercent = (overallRate * 100).toFixed(1);
+
+        lines.push('');
+        lines.push(`Overall: ${totalSuccesses}/${totalAttempts} (${overallPercent}%)`);
+        if (lastAdoptedSuccessRate !== null) {
+            const lastPercent = (lastAdoptedSuccessRate * 100).toFixed(1);
+            lines.push(`Previous adopted success: ${lastPercent}%`);
+        } else {
+            lines.push('Previous adopted success: (none)');
+        }
+        lines.push('');
+        lines.push('Adopt new parameters for Autopilot/Manual?');
+
+        const text = this.add.text(600, 300, lines.join('\n'), {
+            fontSize: '18px',
+            fill: '#0f0',
+            align: 'left',
+            backgroundColor: '#000c',
+            padding: { x: 20, y: 10 }
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(2000);
+
+        const makeButton = (label, offsetX, handler) => {
+            const btnBg = this.add.rectangle(600 + offsetX, 520, 140, 40, 0x003344, 0.9)
+                .setScrollFactor(0)
+                .setDepth(2001)
+                .setInteractive({ useHandCursor: true });
+            const btnText = this.add.text(600 + offsetX, 520, label, {
+                fontSize: '18px',
+                fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(2002);
+            btnBg.on('pointerdown', handler);
+            return { btnBg, btnText };
+        };
+
+        const adoptBtn = makeButton('Adopt', -90, () => {
+            defaultTuningParams = cloneTuningParams(activeTuningParams);
+            lastAdoptedSuccessRate = overallRate;
+            text.destroy();
+            adoptBtn.btnBg.destroy();
+            adoptBtn.btnText.destroy();
+            keepBtn.btnBg.destroy();
+            keepBtn.btnText.destroy();
+            saveTuningToStorage();
+            globalMode = 'MENU';
+            experimentConfig.enabled = false;
+            this.scene.restart();
+        });
+
+        const keepBtn = makeButton('Keep', 90, () => {
+            text.destroy();
+            adoptBtn.btnBg.destroy();
+            adoptBtn.btnText.destroy();
+            keepBtn.btnBg.destroy();
+            keepBtn.btnText.destroy();
+            globalMode = 'MENU';
+            experimentConfig.enabled = false;
+            this.scene.restart();
+        });
+    }
+}
+
+const config = {
+    type: Phaser.AUTO,
+    width: 1200,
+    height: 800,
+    parent: 'game-container',
+    backgroundColor: '#000814',
+    dom: {
+        createContainer: true
+    },
+    physics: {
+        default: 'arcade',
+        arcade: {
+            gravity: { y: 0 },
+            debug: false
+        }
+    },
+    scene: [GameScene]
+};
+
+const game = new Phaser.Game(config);
+console.log('Game initialized');
+    </script>
+</body>
+</html>
