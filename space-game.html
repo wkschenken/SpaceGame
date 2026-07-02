@@ -1209,12 +1209,12 @@ class GameScene extends Phaser.Scene {
         this.createGravityObjects();
         this.createPickups();
         
-        // Plan an initial slingshot path (requires massive objects). If we are
-        // in AUTOPILOT or TEST modes and a slingshot plan exists, kick off the
-        // numerical refinement sweep. The sweep itself runs incrementally in
-        // update() so we can display progress before the run begins.
+        // Plan an initial slingshot path (requires massive objects). In
+        // AUTOPILOT and TEST modes we always run the numerical refinement
+        // sweep; if no useful analytic plan exists, the sweep still explores
+        // trajectories around the straight S->E line.
         this.planSlingshotPath();
-        if ((this.mode === 'AUTOPILOT' || this.mode === 'TEST') && this.slingshotPlan) {
+        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST') {
             this.refineSlingshotPlanNumerically();
         }
         
@@ -1575,7 +1575,7 @@ class GameScene extends Phaser.Scene {
         let bestPerpDist = 0;
         let bestCorridorRadius = 0;
 
-        const corridorFactor = 1.0; // R_corridor = corridorFactor * schwarzschildRadius (tighter: only very close objects impede)
+        const corridorFactor = 2.0; // widened corridor so more nearby objects are treated as interfering
 
         this.gravityObjects.forEach(obj => {
             const Cx = obj.x;
@@ -1609,7 +1609,19 @@ class GameScene extends Phaser.Scene {
         });
 
         if (!bestObj) {
-            return; // no interfering massive object found along initial straight path
+            // No interfering massive object along the straight S->E line; we
+            // still want the numeric sweep to run, so fall back to a default
+            // corridor and impact parameter based on the first gravity object
+            // if available.
+            if (!this.gravityObjects || this.gravityObjects.length === 0) {
+                return;
+            }
+            bestObj = this.gravityObjects[0];
+            bestT = lenSE * 0.5;
+
+            const schwarzschildRadius = bestObj.getData('schwarzschildRadius') || 0;
+            bestCorridorRadius = corridorFactor * schwarzschildRadius;
+            bestPerpDist = bestCorridorRadius;
         }
 
         const Cx = bestObj.x;
@@ -1968,10 +1980,6 @@ class GameScene extends Phaser.Scene {
         // Initialize the incremental numerical sweep state. The actual work is
         // performed in updateSlingshotSweep() so we can display progress and
         // avoid blocking the main thread.
-        const plan = this.slingshotPlan;
-        if (!plan) {
-            return;
-        }
 
         if (!this.gravityObjects || this.gravityObjects.length === 0) {
             return;
@@ -1990,7 +1998,8 @@ class GameScene extends Phaser.Scene {
         const Ex = this.earthX;
         const Ey = this.earthY;
 
-        // Preserve the original green S->E baseline for crossing detection.
+        // Preserve the original green S->E baseline for crossing detection and
+        // as the reference direction for the sweep.
         const dxSE = Ex - Sx;
         const dySE = Ey - Sy;
         const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
@@ -1998,21 +2007,8 @@ class GameScene extends Phaser.Scene {
             return;
         }
 
-        // Use the line from the rocket start to the star as the reference
-        // direction for the sweep, rather than the S->E baseline.
-        const primaryMass = masses[0].obj;
-        const Cx = primaryMass.x;
-        const Cy = primaryMass.y;
-
-        const dxBase = Cx - Sx;
-        const dyBase = Cy - Sy;
-        const lenBase = Math.sqrt(dxBase * dxBase + dyBase * dyBase);
-        if (lenBase < 1e-3) {
-            return;
-        }
-
-        const uxBase = dxBase / lenBase;
-        const uyBase = dyBase / lenBase;
+        const uxBase = dxSE / lenSE;
+        const uyBase = dySE / lenSE;
 
         const vCruise = activeTuningParams.vCruise;
         if (typeof vCruise !== 'number' || vCruise <= 0) {
@@ -2049,7 +2045,6 @@ class GameScene extends Phaser.Scene {
         this.slingshotSweepData = {
             Sx, Sy, Ex, Ey,
             dxSE, dySE, lenSE,
-            dxBase, dyBase, lenBase,
             uxBase, uyBase,
             vCruise,
             masses,
@@ -2091,7 +2086,6 @@ class GameScene extends Phaser.Scene {
         const {
             Sx, Sy, Ex, Ey,
             dxSE, dySE, lenSE,
-            dxBase, dyBase, lenBase,
             uxBase, uyBase,
             vCruise,
             masses,
