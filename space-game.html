@@ -801,9 +801,13 @@ class AutopilotController {
                 const lerp = (clampedDist - minDist) / (maxDist - minDist); // 0 near Earth, 1 far away
 
                 const vTanStartFar = 6.0; // require larger v_tan to trigger correction far away
-                const vTanStartNear = 0.6;
+                const vTanStartNear = 0.5; // near-Earth tolerance for starting a correction
 
                 const vTanStart = vTanStartNear + (vTanStartFar - vTanStartNear) * lerp;
+
+                // Fixed stop threshold for an active correction: once |v_tan|
+                // drops below this value, we terminate the burn early.
+                const vTanStop = 0.5;
 
                 // Simple cooldown: wait some time after the last correction before
                 // starting a new one, to avoid back-to-back impulses.
@@ -829,6 +833,14 @@ class AutopilotController {
 
                 // If a correction is active, burn until the remaining impulse is exhausted.
                 if (!slingshotApproach && this.vTanCorrectionActive && this.vTanCorrectionRemainingImpulse > 0) {
+                    // Re-evaluate the current tangential velocity: if it is already
+                    // below the stop threshold, terminate the correction early.
+                    if (tangentialForControl <= vTanStop) {
+                        this.vTanCorrectionActive = false;
+                        this.timeSinceLastVTanCorrection = 0;
+                        this.vTanCorrectionBurnTime = 0;
+                        this.vTanCorrectionRemainingImpulse = 0;
+                    } else {
                     // Thrust only while we are in correction mode and roughly aligned with
                     // the anti-v_tan heading chosen in computeDesiredHeading.
                     const aligned = Math.abs(angleError) < 0.2; // ~11.5 deg
@@ -861,6 +873,7 @@ class AutopilotController {
                         this.timeSinceLastVTanCorrection = 0;
                         this.vTanCorrectionBurnTime = 0;
                         this.vTanCorrectionRemainingImpulse = 0;
+                    }
                     }
                 }
 
