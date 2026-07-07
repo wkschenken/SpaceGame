@@ -1,74 +1,51 @@
-# Space Race - Relativistic Journey
+# Space Race — Relativistic Journey
 
-A Phaser 3 space racing game where you pilot a spaceship through a field of asteroids, gravity wells, and relativistic effects to reach Earth in the shortest time possible.
+> **Note:** This project was generated with AI assistance (via the Cascade / Windsurf agent). Every line of code, every design decision, and this README itself was produced through iterative prompting rather than written from scratch by a human. Treat it as a demo of AI-driven game development, not a hand-crafted production codebase.
 
-Created with AI, obviously. 
+## What it is
 
-Try selecting "Massive objects" with "Autopilot" mode. 
+A single-file 2D space game where the player (or an autopilot) flies a ship from a random starting point to Earth across a large 2D world, optionally using a massive star's gravity for a slingshot assist. Time dilation is simulated: the ship's onboard clock runs slower than Earth's when moving fast or deep in the star's gravity well.
 
-## Features
+## How to run
 
-- **Spaceship Controls**: Rotate and accelerate your ship through space
-- **Asteroids**: Obstacles that can be destroyed with ammunition or avoided
-- **Gravity Objects**: 
-  - **Stars** (yellow): Moderate gravity pull and time dilation
-  - **Black Holes** (purple): Strong gravity pull and extreme time dilation
-- **Resource Management**:
-  - **Fuel**: Required for acceleration
-  - **Ammunition**: Used to destroy asteroids
-- **Pickups**:
-  - **Green stars**: Fuel refills
-  - **Orange stars**: Ammunition refills
-- **Relativistic Time Mechanics**: 
-  - Time passes differently on your ship vs. Earth
-  - Proximity to massive objects slows your ship's time
-  - High velocity also causes time dilation
-  - Goal: Minimize Earth time to reach the destination
+1. Open `space-game.html` in any modern browser (double-click works).
+2. That's it. No build, no server, no `npm install`.
 
-## Setup
+The file loads Phaser 3.60 from the jsDelivr CDN, so an internet connection is required the first time you open it (browser caching handles subsequent loads).
 
-1. Install dependencies:
-```bash
-npm install
-```
+## Modes
 
-2. Start the development server:
-```bash
-npm start
-```
+- **MANUAL** — fly the ship yourself with the keyboard.
+- **AUTOPILOT** — the autopilot plans a slingshot trajectory (numerical sweep of departure angles under simulated gravity) and flies the ship to Earth automatically.
+- **TEST** — batch experiment that runs many autopilot trials at a sweep of approach angles and reports success rates. Used for tuning the autopilot.
 
-3. The game will open automatically in your browser at `http://localhost:8080`
+## Controls (MANUAL mode)
 
-## Controls
+- **Arrow keys** — rotate / thrust
+- **Space** — fire (if the mode / build includes weapons)
+- **R** — restart current run after landing or crashing
 
-- **Arrow Keys**: 
-  - Left/Right: Rotate ship
-  - Up: Accelerate (consumes fuel)
-- **Spacebar**: Shoot (consumes ammunition)
-- **R**: Restart game (after win/loss)
+## HUD & overlays
 
-## Gameplay
+- Top-left: fuel, ammo, distance, radial/tangential velocities, attitude error, phase, etc.
+- Bottom-left: **Trajectory Map** — a minimap showing the start point, Earth, the star, the planned red trajectory, and the ship's live position along it.
+- Top-right (after a run finishes): **Retry Same Seed** / **New Seed** buttons.
 
-1. Start at the left side of the screen
-2. Navigate through asteroids, avoiding collisions
-3. Use gravity wells strategically (they pull you but also slow your time)
-4. Collect fuel and ammo pickups as needed
-5. Reach Earth (blue planet on the right) in minimum Earth time
-6. Watch the time dilation effects - your ship time vs Earth time!
+## Notable mechanics
 
-## Strategy Tips
+- **Numerical slingshot planner.** For AUTOPILOT / TEST runs, the game sweeps candidate departure angles in two cones on either side of the straight start→Earth line, integrates each trajectory under gravity, and picks the fastest one whose intercept lands within the Earth-radius circle. A finer refinement sweep tightens the winning candidate.
+- **Retry same seed.** After a run, the exact start position, Earth position, and star position are snapshotted. "Retry Same Seed" replays that identical world; "New Seed" re-randomizes.
+- **Relativistic clocks.** Ship time advances more slowly than Earth time as a function of velocity and gravitational potential. Both are shown on the HUD, and the "time lost" delta is reported at the end of successful runs.
 
-- Avoid flying too close to gravity objects to minimize time dilation
-- Plan your route to balance speed vs. time dilation effects
-- Shoot asteroids in your path or navigate around them
-- Manage fuel carefully - you need it to accelerate and maneuver
-- Collect pickups when safe to do so
+## Files
 
-## Future Enhancements
+The entire game lives in a single file:
 
-- Multiple levels with increasing difficulty
-- More complex gravity interactions
-- Power-ups and ship upgrades
-- Leaderboard for best times
-- Enhanced graphics and particle effects
-- Sound effects and music
+- `space-game.html` — HTML shell, inline CSS, and inline Phaser scene (~4000 lines of JS).
+
+That's the whole project. No other files are required.
+
+## Caveats
+
+- Because it was AI-generated iteratively, the codebase has stylistic inconsistencies, comments that reference now-deleted features, and defensive checks that may be dead code. It works, but it is not architected for long-term maintenance.
+- The Phaser CDN link pins version 3.60.0. If that URL ever goes away, update the `<script src="...">` in `space-game.html`.
