@@ -791,23 +791,13 @@ class AutopilotController {
                     lateralThrust = Phaser.Math.Clamp(aLatCmd, -this.maxLateralAccel, this.maxLateralAccel);
                 }
 
-                // Distance-dependent thresholds: allow larger v_tan far away,
-                // but tighten the requirement as we get closer to Earth.
-                // Example: at dist >= 5000, tolerate up to ~2 units before correcting;
-                // near Earth (~500), tolerate only ~0.5 before correcting and stop at ~0.05.
-                const maxDist = 5000;
-                const minDist = 500;
-                const clampedDist = Phaser.Math.Clamp(dist, minDist, maxDist);
-                const lerp = (clampedDist - minDist) / (maxDist - minDist); // 0 near Earth, 1 far away
-
-                const vTanStartFar = 6.0; // require larger v_tan to trigger correction far away
-                const vTanStartNear = 0.5; // near-Earth tolerance for starting a correction
-
-                const vTanStart = vTanStartNear + (vTanStartFar - vTanStartNear) * lerp;
-
-                // Fixed stop threshold for an active correction: once |v_tan|
-                // drops below this value, we terminate the burn early.
-                const vTanStop = 0.5;
+                // Tangential-velocity threshold for impulse corrections. Use the
+                // current path-relative tangential speed, and only engage the
+                // discrete correction logic when |v_tan| exceeds a fixed
+                // threshold. This threshold is independent of distance so that
+                // the behaviour is easier to reason about.
+                const vTanCurrent = tangentialForControl;
+                const vTanThreshold = 2.0;
 
                 // Simple cooldown: wait some time after the last correction before
                 // starting a new one, to avoid back-to-back impulses.
@@ -819,10 +809,10 @@ class AutopilotController {
                 if (!slingshotApproach &&
                     !this.vTanCorrectionActive &&
                     this.timeSinceLastVTanCorrection > cooldown &&
-                    tangentialForControl > vTanStart) {
+                    Math.abs(vTanCurrent) > vTanThreshold) {
                     // Start a new analytic correction: snapshot |v_tan| and compute
                     // the desired impulse I = m*|v_tan| (with a small gain) to cancel it.
-                    const vTanMag = tangentialForControl;
+                    const vTanMag = Math.abs(vTanCurrent);
                     const m = this.shipMass;
                     const gain = this.vTanImpulseGain || 1.0;
                     this.vTanCorrectionRemainingImpulse = m * vTanMag * gain;
@@ -831,11 +821,18 @@ class AutopilotController {
                     this.vTanCorrectionActive = true;
                 }
 
-                // If a correction is active, burn until the remaining impulse is exhausted.
-                if (!slingshotApproach && this.vTanCorrectionActive && this.vTanCorrectionRemainingImpulse > 0) {
-                    // Re-evaluate the current tangential velocity: if it is already
-                    // below the stop threshold, terminate the correction early.
-                    if (tangentialForControl <= vTanStop) {
+                // If a correction is active, burn while the current |v_tan|
+                // remains above the threshold and the remaining impulse budget
+                // is positive.
+                if (!slingshotApproach &&
+                    this.vTanCorrectionActive &&
+                    this.vTanCorrectionRemainingImpulse > 0) {
+
+                    // Abort an ongoing correction early if |v_tan| has already
+                    // fallen below the threshold; this allows the controller
+                    // to stop burning once the tangential velocity is small,
+                    // and to reactivate later if |v_tan| grows again.
+                    if (Math.abs(vTanCurrent) <= vTanThreshold) {
                         this.vTanCorrectionActive = false;
                         this.timeSinceLastVTanCorrection = 0;
                         this.vTanCorrectionBurnTime = 0;
@@ -1144,9 +1141,12 @@ class AutopilotController {
             const sideFuelRate = 0.005;
             totalFuelUse += Math.abs(aLat) * dt * sideFuelRate;
 
-            // Visual flags for side thrusters
-            this.scene.sideThrustLeft = aLat > 0;
-            this.scene.sideThrustRight = aLat < 0;
+            // Visual flags for side thrusters. Positive lateral acceleration
+            // pushes the ship to its left (in the ship's local frame), which
+            // corresponds to a thruster firing on the right-hand side, and
+            // vice-versa.
+            this.scene.sideThrustLeft = aLat < 0;
+            this.scene.sideThrustRight = aLat > 0;
         } else {
             this.scene.sideThrustLeft = false;
             this.scene.sideThrustRight = false;
@@ -1514,8 +1514,8 @@ class GameScene extends Phaser.Scene {
         obj.body.setCircle(radius);
         obj.body.setImmovable(true);
 
-        // Gravity parameters stored on the object
-        obj.setData('gravityStrength', 76800);
+        // Gravity parameters stored on the object (doubled strength)
+        obj.setData('gravityStrength', 153600);
         obj.setData('schwarzschildRadius', radius * 1.5);
         obj.setData('mass', 80);
 
@@ -2954,7 +2954,10 @@ class GameScene extends Phaser.Scene {
             const dyE = this.earth.y - this.player.y;
             const distE = Math.sqrt(dxE * dxE + dyE * dyE);
             if (distE > 1) {
-                const earthGravityStrength = 0; // still weaker than most stars/black holes but strong enough to pull us in
+                // Earth gravity strength (non-zero, tuned and effectively doubled
+                // relative to the previous weak setting) so that Earth's pull is
+                // noticeable but still weaker than the massive star.
+                const earthGravityStrength = 40000;
                 const gE = earthGravityStrength / (distE * distE);
                 const fxE = (dxE / distE) * gE;
                 const fyE = (dyE / distE) * gE;
