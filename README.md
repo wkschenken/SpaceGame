@@ -2,6 +2,10 @@
 
 A Phaser 3 space racing game where you pilot a spaceship through a field of asteroids, gravity wells, and relativistic effects to reach Earth in the shortest time possible.
 
+Created with AI, obviously. 
+
+Try selecting "Massive objects" with "Autopilot" mode. 
+
 ## Features
 
 - **Spaceship Controls**: Rotate and accelerate your ship through space
