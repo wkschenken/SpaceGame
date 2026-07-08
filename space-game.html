@@ -186,7 +186,7 @@
     loadTuningFromStorage();
 
     const tuningParamsDefinition = [
-        { key: 'vCruise',       label: 'Cruise speed',                 step: 20,   min: 50,   max: 800,  decimals: 0 },
+        { key: 'vCruise',       label: 'Cruise speed',                 step: 10,   min: 50,   max: 400,  decimals: 0 },
         { key: 'brakeDistScale',label: 'Brake distance scale',         step: 0.05, min: 0.1,  max: 5.0,  decimals: 2 },
         { key: 'kpAngle',       label: 'ORIENT kp',                    step: 0.2,  min: 0.0,  max: 50.0, decimals: 2 },
         { key: 'kdAngle',       label: 'ORIENT kd',                    step: 0.1,  min: 0.0,  max: 50.0, decimals: 2 },
@@ -3102,7 +3102,7 @@ class GameScene extends Phaser.Scene {
                 const msg = this.add.text(
                     cx,
                     cy,
-                    'Autopilot disabled: no viable slingshot trajectory found.\nAdjust Isp / vCruise and restart.',
+                    'Autopilot disabled: no viable slingshot trajectory found.\nAdjust Isp / vCruise and restart, or respawn below.',
                     {
                         fontSize: '18px',
                         fill: '#ff8080',
@@ -3116,6 +3116,10 @@ class GameScene extends Phaser.Scene {
                 if (this.autopilot) {
                     this.autopilot.enabled = false;
                 }
+
+                // Give the player a one-click respawn path (same seed or new
+                // seed) in addition to the tuning-panel workflow.
+                this.showRetryPanel();
 
                 return;
             }
@@ -3597,7 +3601,6 @@ class GameScene extends Phaser.Scene {
         this.earthClockLabel.setText('EARTH CLOCK');
         this.earthClockText = mkText(22, '#88bbff', true);
         this.dilationText = mkText(14, '#ffffff', true);
-        this.timeGapText = mkText(12, '#ffcc66', false);
         
         // Instructions
         this.add.text(
@@ -4404,15 +4407,11 @@ class GameScene extends Phaser.Scene {
         const px = 10;
         const py = 260;
         const pw = 380;
-        const ph = 108;
+        const ph = 84;
 
         const dil = this.currentDilation || 1.0;
         // Gamma: how much faster the Earth clock runs vs. the ship clock.
         const gamma = 1 / Math.max(0.05, dil);
-        const gapSec = this.earthTime - this.shipTime;
-        const shipYrs = this.shipTime * TIME_NARRATIVE_YEARS_PER_SECOND;
-        const earthYrs = this.earthTime * TIME_NARRATIVE_YEARS_PER_SECOND;
-        const gapYrs = gapSec * TIME_NARRATIVE_YEARS_PER_SECOND;
 
         // Color-code the panel border and dilation-factor text by severity.
         let borderColor = 0x66aa66;
@@ -4447,11 +4446,6 @@ class GameScene extends Phaser.Scene {
             const s = t - m * 60;
             return `${m}m ${s.toFixed(1)}s`;
         };
-        const fmtYears = (y) => {
-            if (y < 1) return `${(y * 12).toFixed(1)} months`;
-            if (y < 100) return `${y.toFixed(1)} years`;
-            return `${Math.round(y).toLocaleString()} years`;
-        };
 
         const leftCx = px + pw * 0.25;
         const rightCx = px + pw * 0.75;
@@ -4464,16 +4458,6 @@ class GameScene extends Phaser.Scene {
             .setPosition(px + pw / 2, py + 60)
             .setText(`γ = ${gamma.toFixed(2)}×   ship / earth clock rate = ${dil.toFixed(3)}`)
             .setFill(dilFill);
-
-        let gapStr;
-        if (gapSec < 1) {
-            gapStr = 'Clocks are essentially synchronized';
-        } else if (gapSec < 60) {
-            gapStr = `Earth is ${gapSec.toFixed(1)}s (${fmtYears(gapYrs)}) ahead of you`;
-        } else {
-            gapStr = `Earth is ${(gapSec / 60).toFixed(1)}m (${fmtYears(gapYrs)}) ahead of you`;
-        }
-        this.timeGapText.setPosition(px + pw / 2, py + 84).setText(gapStr);
     }
 
     drawAutopilotControls() {

@@ -1,6 +1,6 @@
 # Space Race — Relativistic Journey
 
-> **Note:** This project (including this README file) was generated with AI assistance, obviously, via the Cascade / Windsurf agent through iterative prompting. 
+> **Note:** This project (including this README file) was generated with AI assistance, obviously, via the Cascade / Windsurf agent through iterative prompting.
 
 ## What it is
 
