@@ -1,6 +1,6 @@
 # Space Race — Relativistic Journey
 
-> **Note:** This project was generated with AI assistance (via the Cascade / Windsurf agent). Every line of code, every design decision, and this README itself was produced through iterative prompting rather than written from scratch by a human. Treat it as a demo of AI-driven game development, not a hand-crafted production codebase.
+> **Note:** This project (including this README file) was generated with AI assistance, obviously, via the Cascade / Windsurf agent through iterative prompting. 
 
 ## What it is
 
