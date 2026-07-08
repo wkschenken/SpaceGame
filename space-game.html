@@ -622,11 +622,12 @@ class AutopilotController {
 
         switch (this.currentPhase) {
             case this.phases.ORIENT:
-                // Check if aligned with target heading
-                const targetHeading = this.computeDesiredHeading(sensors);
-                const angleDiff = Math.abs(Phaser.Math.Angle.Wrap(sensors.theta - targetHeading));
-                const omegaSmallOrient = Math.abs(sensors.omega) < Phaser.Math.DegToRad(0.5); // <0.5 deg/s
-                if (angleDiff < Phaser.Math.DegToRad(0.5) && omegaSmallOrient) { // ~0.5 degree
+                // Transition as soon as the initial bang-bang attitude
+                // schedule has completed. Any residual attitude error is
+                // handled by the CRUISE/BOOST PID controller along the path,
+                // so we no longer wait for a tight angle+rate convergence
+                // here.
+                if (this.orientBangUsed) {
                     // Only go straight to BRAKE if we're close enough, generally inward,
                     // and moving at a reasonable inward speed; otherwise BOOST toward cruise.
                     const vRadInwardEnough = radialV < -0.3 * this.vCruise;
@@ -1334,6 +1335,7 @@ class GameScene extends Phaser.Scene {
         this.slingshotPlan = null;
         this.minimapGraphics = null;
         this.minimapLabel = null;
+        this.starMotionStarted = false;
 
         // Plan a slingshot path only in AUTOPILOT / TEST modes. MANUAL play
         // has no planning phase and no autopilot.
@@ -1342,7 +1344,7 @@ class GameScene extends Phaser.Scene {
         }
         
         // Setup camera (locked to ship center)
-        this.cameras.main.startFollow(this.player, true, 1, 1);
+        this.cameras.main.startFollow(this.player, false, 1, 1);
         this.cameras.main.setBounds(0, 0, this.worldWidth, this.worldHeight);
         
         // UI
@@ -1539,8 +1541,13 @@ class GameScene extends Phaser.Scene {
         this.player.body.setMaxVelocity(400);
         this.player.body.setCollideWorldBounds(false);
         
-        // Ship orientation: 0 rad points along +X (to the right)
-        this.playerAngle = 0;
+        // Ship orientation: 0 rad points along +X (to the right). Initialize
+        // pointing along the S->E baseline so the autopilot's ORIENT phase
+        // completes essentially immediately at launch. This also minimizes
+        // the time the star drifts while the ship is still re-orienting,
+        // reducing the mismatch between the sweep's assumed launch state
+        // and reality.
+        this.playerAngle = Math.atan2(this.earthY - startY, this.earthX - startX);
         this.angularVelocity = 0;
         
         // Visual ship body, drawn as a sleek triangular craft
@@ -1630,9 +1637,12 @@ class GameScene extends Phaser.Scene {
         // distance so typical samples lie of order sqrt(lenSE) from the
         // midpoint.
 
-        // Midpoint along the baseline in world coordinates.
-        const midX = Sx + uxSE * (lenSE * 0.5);
-        const midY = Sy + uySE * (lenSE * 0.5);
+        // Nominal center of the moving-star target distribution: 40% along
+        // the S-E baseline (so the moving star typically crosses the baseline
+        // when the rocket has covered ~40% of the S-E distance).
+        const targetFrac = 0.4;
+        const targetCenterX = Sx + uxSE * (lenSE * targetFrac);
+        const targetCenterY = Sy + uySE * (lenSE * targetFrac);
 
         // One-dimensional Gaussian sampler (Box-Muller transform).
         const sampleGaussian = () => {
@@ -1647,23 +1657,129 @@ class GameScene extends Phaser.Scene {
         const variance = 0.5 * lenSE;
         const stdDev = Math.sqrt(Math.max(variance, 1e-3));
 
-        let objX, objY;
+        // ---- Shared velocity samplers ----
+        // Isotropic direction (uniform over 2*pi), Gaussian(mean=200, sd=50)
+        // speed clamped positive. Same distribution for every star.
+        const sampleStarVelocity = () => {
+            const dirAngle = Math.random() * Math.PI * 2;
+            const dirX = Math.cos(dirAngle);
+            const dirY = Math.sin(dirAngle);
+            const speed = Math.max(1, 200 + sampleGaussian() * 50);
+            return { vx: dirX * speed, vy: dirY * speed };
+        };
+
+        // Earth-clearance check: closed-form min distance between Earth and
+        // the straight-line ray (px + vx*t, py + vy*t) for t in [0, horizon].
+        // Straight-line is an approximation (star-star gravity can deflect
+        // the trajectory), but the buffer below is large enough that stars
+        // are expected to remain in a regime where their gravitational
+        // coupling to Earth is negligible for the whole gameplay horizon.
+        const earthClearRadius = 10 * (35 * 20); // 10 star radii ~ 7000 units
+        const earthClearRadius2 = earthClearRadius * earthClearRadius;
+        const vCruiseClear = (activeTuningParams && activeTuningParams.vCruise) || 200;
+        const earthClearHorizon = 2.0 * lenSE / vCruiseClear;
+        const clearsEarth = (pxStar, pyStar, vxStar, vyStar) => {
+            const v2 = vxStar * vxStar + vyStar * vyStar;
+            let tOpt;
+            if (v2 < 1e-9) {
+                tOpt = 0;
+            } else {
+                tOpt = -((pxStar - Ex) * vxStar + (pyStar - Ey) * vyStar) / v2;
+                if (tOpt < 0) tOpt = 0;
+                else if (tOpt > earthClearHorizon) tOpt = earthClearHorizon;
+            }
+            const rx = pxStar + vxStar * tOpt - Ex;
+            const ry = pyStar + vyStar * tOpt - Ey;
+            return (rx * rx + ry * ry) >= earthClearRadius2;
+        };
+
+        // Rejection-sample a velocity that keeps the star clear of Earth
+        // over the horizon. Fallback: point directly away from Earth.
+        const sampleStarVelocityClearingEarth = (starPosX, starPosY) => {
+            for (let attempt = 0; attempt < 200; attempt++) {
+                const v = sampleStarVelocity();
+                if (clearsEarth(starPosX, starPosY, v.vx, v.vy)) return v;
+            }
+            const dxAway = starPosX - Ex;
+            const dyAway = starPosY - Ey;
+            const rAway = Math.sqrt(dxAway * dxAway + dyAway * dyAway) || 1;
+            const speed = Math.max(1, 200 + sampleGaussian() * 50);
+            return {
+                vx: (dxAway / rAway) * speed,
+                vy: (dyAway / rAway) * speed
+            };
+        };
+
+        // ---- Moving star ----
+        // The star drifts with constant velocity. We sample the star's expected
+        // position at the moment the rocket reaches the S-E midpoint (call it
+        // r_target) from the same Gaussian distribution used for the previous
+        // static-star build, then back-propagate to the star's t=0 position:
+        //     r_s(0) = r_target - v * t_h
+        // where t_h is the rocket's estimated half-transit time.
+        //
+        // Velocity constraints:
+        //   - Direction: within +/-20 deg of the perpendicular to the S-E
+        //     baseline, on whichever side leaves the star moving toward the
+        //     baseline at t=0 (rejection-and-flip).
+        //   - Speed: Gaussian(mean=200, sd=50), clamped positive.
+
+        let x0, y0, vx, vy;
         const snap = this.worldSnapshot && this.worldSnapshot.gravityObject;
-        if (this.replayRequested && !experimentConfig.enabled && snap) {
-            objX = snap.x;
-            objY = snap.y;
+        if (this.replayRequested && !experimentConfig.enabled && snap && typeof snap.vx === 'number') {
+            x0 = snap.x0;
+            y0 = snap.y0;
+            vx = snap.vx;
+            vy = snap.vy;
         } else {
+            // r_target: Gaussian around the S-E midpoint (same distribution
+            // as the previous static-star placement).
             const alongOffset = sampleGaussian() * stdDev;
             const perpOffset = sampleGaussian() * stdDev;
-            objX = midX + uxSE * alongOffset + px * perpOffset;
-            objY = midY + uySE * alongOffset + py * perpOffset;
+            const rTargetX = targetCenterX + uxSE * alongOffset + px * perpOffset;
+            const rTargetY = targetCenterY + uySE * alongOffset + py * perpOffset;
+
+            // Time-to-target estimate: fraction of S-E distance at cruise.
+            const vCruise = (activeTuningParams && activeTuningParams.vCruise) || 200;
+            const tHalf = targetFrac * lenSE / vCruise;
+
+            // Sample velocity (isotropic direction, Gaussian speed) and
+            // back-propagate the star's t=0 position. Reject any velocity
+            // whose resulting straight-line trajectory would bring the star
+            // within earthClearRadius of Earth over the horizon.
+            let accepted = false;
+            for (let attempt = 0; attempt < 200; attempt++) {
+                const vTry = sampleStarVelocity();
+                const x0Try = rTargetX - vTry.vx * tHalf;
+                const y0Try = rTargetY - vTry.vy * tHalf;
+                if (clearsEarth(x0Try, y0Try, vTry.vx, vTry.vy)) {
+                    vx = vTry.vx; vy = vTry.vy;
+                    x0 = x0Try; y0 = y0Try;
+                    accepted = true;
+                    break;
+                }
+            }
+            if (!accepted) {
+                // Fallback: aim the star velocity radially away from Earth
+                // relative to r_target so back-propagation places (x0, y0)
+                // on Earth's side but the trajectory heads away.
+                const dxAway = rTargetX - Ex;
+                const dyAway = rTargetY - Ey;
+                const rAway = Math.sqrt(dxAway * dxAway + dyAway * dyAway) || 1;
+                const speed = Math.max(1, 200 + sampleGaussian() * 50);
+                vx = (dxAway / rAway) * speed;
+                vy = (dyAway / rAway) * speed;
+                x0 = rTargetX - vx * tHalf;
+                y0 = rTargetY - vy * tHalf;
+            }
+
             if (!this.worldSnapshot) this.worldSnapshot = {};
-            this.worldSnapshot.gravityObject = { x: objX, y: objY };
+            this.worldSnapshot.gravityObject = { x0, y0, vx, vy };
         }
 
         // Star visual radius scaled up 20x relative to the original 35.
         const radius = 35 * 20;
-        const obj = this.add.circle(objX, objY, radius, 0xffaa00, 0.6);
+        const obj = this.add.circle(x0, y0, radius, 0xffaa00, 0.6);
         this.physics.add.existing(obj);
         obj.body.setCircle(radius);
         obj.body.setImmovable(true);
@@ -1674,7 +1790,265 @@ class GameScene extends Phaser.Scene {
         obj.setData('schwarzschildRadius', radius * 1.5);
         obj.setData('mass', 80);
 
+        // Store the moving-star kinematic state. The trajectory sweep reads
+        // these to compute star position at arbitrary sim times without
+        // depending on the sprite's actual (x, y). The main-loop starter
+        // (startStarMotion) applies vx/vy to the physics body once gameplay
+        // begins.
+        obj.setData('x0', x0);
+        obj.setData('y0', y0);
+        obj.setData('vx', vx);
+        obj.setData('vy', vy);
+
         this.gravityObjects.push(obj);
+
+        // ---- Second star ----
+        // Nominal position: 80% along the S-E baseline, perpendicularly offset
+        // by 3 star radii on a random side. Actual position: 2D Gaussian
+        // (sd = 3 star radii in both along-baseline and perpendicular axes)
+        // around that nominal. Physically identical to the primary star, with
+        // a randomly sampled velocity from the same distribution.
+        let star2X, star2Y, vx2, vy2;
+        const snap2 = this.worldSnapshot && this.worldSnapshot.gravityObject2;
+        if (this.replayRequested && !experimentConfig.enabled && snap2 && typeof snap2.vx === 'number') {
+            star2X = snap2.x0;
+            star2Y = snap2.y0;
+            vx2 = snap2.vx;
+            vy2 = snap2.vy;
+        } else {
+            const star2Radius = 35 * 20;
+            const sd2 = 3 * star2Radius;
+            const sideSign2 = (Math.random() < 0.5) ? +1 : -1;
+
+            // Nominal (mean) position.
+            const nomAlong = 0.8 * lenSE;
+            const nomPerp  = sideSign2 * 3 * star2Radius;
+            const meanX = Sx + uxSE * nomAlong + px * nomPerp;
+            const meanY = Sy + uySE * nomAlong + py * nomPerp;
+
+            // Gaussian noise, sd = 3 star radii in both axes.
+            const noiseAlong = sampleGaussian() * sd2;
+            const noisePerp  = sampleGaussian() * sd2;
+            star2X = meanX + uxSE * noiseAlong + px * noisePerp;
+            star2Y = meanY + uySE * noiseAlong + py * noisePerp;
+
+            const v2 = sampleStarVelocityClearingEarth(star2X, star2Y);
+            vx2 = v2.vx;
+            vy2 = v2.vy;
+
+            if (!this.worldSnapshot) this.worldSnapshot = {};
+            this.worldSnapshot.gravityObject2 = { x0: star2X, y0: star2Y, vx: vx2, vy: vy2 };
+        }
+
+        const radius2 = 35 * 20;
+        const obj2 = this.add.circle(star2X, star2Y, radius2, 0xffaa00, 0.6);
+        this.physics.add.existing(obj2);
+        obj2.body.setCircle(radius2);
+        obj2.body.setImmovable(true);
+
+        obj2.setData('gravityStrength', 153600 * 5 * 10);
+        obj2.setData('schwarzschildRadius', radius2 * 1.5);
+        obj2.setData('mass', 80);
+        obj2.setData('x0', star2X);
+        obj2.setData('y0', star2Y);
+        obj2.setData('vx', vx2);
+        obj2.setData('vy', vy2);
+
+        this.gravityObjects.push(obj2);
+
+        // ---- Background scatter stars ----
+        // Additional stars whose t=0 positions are placed far from the S-E
+        // baseline, far from any already-placed star, and far from the
+        // moving primary star's future straight-line path. Each is then
+        // given a randomly sampled velocity from the same distribution as
+        // the primary. Note: the clearance-from-moving-primary check is
+        // evaluated at placement time and does not account for these
+        // background stars' own drift; with all stars now moving, exact
+        // collision-free evolution is not guaranteed.
+        const bgCount = 4;
+        const bgRadius = 35 * 20;
+        const minBaselinePerp = 8 * bgRadius;   // perp distance from baseline
+        const minStarSeparation = 8 * bgRadius; // to any other star
+        const minMovingClearance = 6 * bgRadius;// moving star's closest approach
+
+        // Horizon for moving-star trajectory clearance check: generous margin
+        // over the nominal transit time.
+        const vCruiseBg = (activeTuningParams && activeTuningParams.vCruise) || 200;
+        const bgHorizon = 2.0 * lenSE / vCruiseBg;
+        const msV2 = vx * vx + vy * vy;
+        const minDistToMovingPath = (Px, Py) => {
+            // Moving-star position at time t: (x0 + vx*t, y0 + vy*t).
+            // Minimize |r(t) - P|^2 over t in [0, bgHorizon].
+            let tOpt;
+            if (msV2 < 1e-9) {
+                tOpt = 0;
+            } else {
+                tOpt = -((x0 - Px) * vx + (y0 - Py) * vy) / msV2;
+                if (tOpt < 0) tOpt = 0;
+                else if (tOpt > bgHorizon) tOpt = bgHorizon;
+            }
+            const rx = x0 + vx * tOpt - Px;
+            const ry = y0 + vy * tOpt - Py;
+            return Math.sqrt(rx * rx + ry * ry);
+        };
+
+        // Load or generate background-star positions and velocities.
+        let bgPositions;
+        const bgSnap = this.worldSnapshot && this.worldSnapshot.backgroundStars;
+        const bgSnapUsable = Array.isArray(bgSnap) && bgSnap.every(b => typeof b.vx === 'number');
+        if (this.replayRequested && !experimentConfig.enabled && bgSnapUsable) {
+            bgPositions = bgSnap;
+        } else {
+            bgPositions = [];
+            const maxAttempts = 200;
+            // Existing-star reference positions (moving star tracked by x0/y0
+            // rather than current sprite position, which will drift once
+            // gameplay begins).
+            const existing = [
+                { x: x0, y: y0 },
+                { x: star2X, y: star2Y }
+            ];
+            for (let i = 0; i < bgCount; i++) {
+                let placed = false;
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    const cx = Math.random() * this.worldSize;
+                    const cy = Math.random() * this.worldSize;
+
+                    // Perpendicular distance from the S-E baseline (line, not
+                    // segment). Rejects anything hugging the corridor the
+                    // rocket flies through.
+                    const relX = cx - Sx;
+                    const relY = cy - Sy;
+                    const perpDist = Math.abs(relX * px + relY * py);
+                    if (perpDist < minBaselinePerp) continue;
+
+                    // Distance to every already-placed star (primary, static,
+                    // and previously accepted background stars).
+                    let tooClose = false;
+                    for (const s of existing) {
+                        const dx = cx - s.x;
+                        const dy = cy - s.y;
+                        if (dx * dx + dy * dy < minStarSeparation * minStarSeparation) {
+                            tooClose = true; break;
+                        }
+                    }
+                    if (tooClose) continue;
+                    for (const bg of bgPositions) {
+                        const dx = cx - bg.x0;
+                        const dy = cy - bg.y0;
+                        if (dx * dx + dy * dy < minStarSeparation * minStarSeparation) {
+                            tooClose = true; break;
+                        }
+                    }
+                    if (tooClose) continue;
+
+                    // Moving-star trajectory clearance.
+                    if (minDistToMovingPath(cx, cy) < minMovingClearance) continue;
+
+                    const vBg = sampleStarVelocityClearingEarth(cx, cy);
+                    bgPositions.push({ x0: cx, y0: cy, vx: vBg.vx, vy: vBg.vy });
+                    placed = true;
+                    break;
+                }
+                if (!placed) {
+                    // Couldn't fit another star given constraints; stop trying.
+                    break;
+                }
+            }
+            if (!this.worldSnapshot) this.worldSnapshot = {};
+            this.worldSnapshot.backgroundStars = bgPositions;
+        }
+
+        // Instantiate the background stars.
+        for (const bg of bgPositions) {
+            const bgObj = this.add.circle(bg.x0, bg.y0, bgRadius, 0xffaa00, 0.6);
+            this.physics.add.existing(bgObj);
+            bgObj.body.setCircle(bgRadius);
+            bgObj.body.setImmovable(true);
+            bgObj.setData('gravityStrength', 153600 * 5 * 10);
+            bgObj.setData('schwarzschildRadius', bgRadius * 1.5);
+            bgObj.setData('mass', 80);
+            bgObj.setData('x0', bg.x0);
+            bgObj.setData('y0', bg.y0);
+            bgObj.setData('vx', bg.vx || 0);
+            bgObj.setData('vy', bg.vy || 0);
+            this.gravityObjects.push(bgObj);
+        }
+    }
+
+    startStarMotion() {
+        // Apply stored velocities to each gravity object's physics body so
+        // Phaser advances their positions each frame. Idempotent (guarded by
+        // this.starMotionStarted).
+        if (this.starMotionStarted) return;
+        if (!this.gravityObjects || this.gravityObjects.length === 0) return;
+        for (const obj of this.gravityObjects) {
+            const vx = obj.getData('vx');
+            const vy = obj.getData('vy');
+            if (typeof vx === 'number' && typeof vy === 'number' && obj.body) {
+                obj.body.setVelocity(vx, vy);
+            }
+        }
+        this.starMotionStarted = true;
+    }
+
+    updateStarGravity(deltaMs) {
+        // Per-frame N-body update: accumulate pairwise gravitational
+        // accelerations between every pair of massive objects (stars) and
+        // apply them to each star's Phaser body velocity. Phaser then
+        // advances each star's position from its (now-updated) velocity.
+        // Runs only after startStarMotion (i.e., after the sweep completes,
+        // or immediately in MANUAL mode). Mirrors the N-body loop inside
+        // simulateForAngle so runtime motion tracks what the sweep planned.
+        if (!this.starMotionStarted) return;
+        const stars = this.gravityObjects;
+        if (!stars || stars.length < 2) return;
+
+        const dt = deltaMs / 1000;
+        const N = stars.length;
+
+        // Precompute mu, x, y per star (avoid repeated getData calls).
+        const sx = new Array(N);
+        const sy = new Array(N);
+        const mu = new Array(N);
+        for (let i = 0; i < N; i++) {
+            sx[i] = stars[i].x;
+            sy[i] = stars[i].y;
+            mu[i] = stars[i].getData('gravityStrength') || 0;
+        }
+
+        // Symmetric pairwise sum: accel on i from j uses mu[j], and by
+        // Newton's third law the accel on j from i uses mu[i] along the
+        // opposite direction.
+        const ax = new Array(N).fill(0);
+        const ay = new Array(N).fill(0);
+        for (let i = 0; i < N; i++) {
+            for (let j = i + 1; j < N; j++) {
+                const dxij = sx[j] - sx[i];
+                const dyij = sy[j] - sy[i];
+                const r2 = dxij * dxij + dyij * dyij;
+                const r  = Math.sqrt(r2);
+                if (r > 1) {
+                    const gj = mu[j] / r2;
+                    const gi = mu[i] / r2;
+                    const ux = dxij / r;
+                    const uy = dyij / r;
+                    ax[i] += ux * gj;
+                    ay[i] += uy * gj;
+                    ax[j] -= ux * gi;
+                    ay[j] -= uy * gi;
+                }
+            }
+        }
+
+        // Apply velocity changes. (Positions are integrated by Phaser from
+        // body.velocity on the next physics step.)
+        for (let i = 0; i < N; i++) {
+            const body = stars[i].body;
+            if (!body) continue;
+            body.velocity.x += ax[i] * dt;
+            body.velocity.y += ay[i] * dt;
+        }
     }
 
     createPickups() {
@@ -1727,8 +2101,18 @@ class GameScene extends Phaser.Scene {
         }
 
         // Build a list of massive objects with valid gravity strengths.
+        // Each entry snapshots the mass's kinematic state at t=0 so the
+        // sweep integrator can compute its position at sim time t as
+        // (x0 + vx*t, y0 + vy*t). Static masses have vx = vy = 0.
         const masses = this.gravityObjects
-            .map(o => ({ obj: o, mu: o.getData('gravityStrength') }))
+            .map(o => ({
+                obj: o,
+                mu: o.getData('gravityStrength'),
+                x0: (typeof o.getData('x0') === 'number') ? o.getData('x0') : o.x,
+                y0: (typeof o.getData('y0') === 'number') ? o.getData('y0') : o.y,
+                vx: (typeof o.getData('vx') === 'number') ? o.getData('vx') : 0,
+                vy: (typeof o.getData('vy') === 'number') ? o.getData('vy') : 0
+            }))
             .filter(m => typeof m.mu === 'number' && m.mu > 0);
         if (masses.length === 0) {
             return;
@@ -1815,7 +2199,21 @@ class GameScene extends Phaser.Scene {
         if (this.gravityObjects && this.gravityObjects[0]) {
             const star = this.gravityObjects[0];
             sunRadius = star.radius || 0;
-            starAlong = (star.x - Sx) * uxBase + (star.y - Sy) * uyBase;
+            // For a moving star, evaluate the along-baseline projection at
+            // the rocket's estimated half-transit time. By construction the
+            // star is near the S-E midpoint at that moment, which is the
+            // sensible reference for the "cross-beyond-star" filter used to
+            // pick slingshot-style trajectories.
+            const sx0 = (typeof star.getData('x0') === 'number') ? star.getData('x0') : star.x;
+            const sy0 = (typeof star.getData('y0') === 'number') ? star.getData('y0') : star.y;
+            const svx = (typeof star.getData('vx') === 'number') ? star.getData('vx') : 0;
+            const svy = (typeof star.getData('vy') === 'number') ? star.getData('vy') : 0;
+            // Reference time = when the rocket reaches ~40% of S-E (this is
+            // when the moving star is designed to be near the baseline).
+            const tHalfRef = 0.4 * lenSE / vCruise;
+            const starRefX = sx0 + svx * tHalfRef;
+            const starRefY = sy0 + svy * tHalfRef;
+            starAlong = (starRefX - Sx) * uxBase + (starRefY - Sy) * uyBase;
         }
         this.slingshotSweepData = {
             Sx, Sy, Ex, Ey,
@@ -1995,6 +2393,23 @@ class GameScene extends Phaser.Scene {
             let vx = vCruise * (uxBase * cosA - uyBase * sinA);
             let vy = vCruise * (uxBase * sinA + uyBase * cosA);
 
+            // Per-trial mutable star state. Each trial starts the stars back
+            // at their t=0 initial conditions and evolves them under mutual
+            // gravity alongside the rocket.
+            const N = masses.length;
+            const starX  = new Array(N);
+            const starY  = new Array(N);
+            const starVX = new Array(N);
+            const starVY = new Array(N);
+            const starAX = new Array(N);
+            const starAY = new Array(N);
+            for (let i = 0; i < N; i++) {
+                starX[i]  = masses[i].x0;
+                starY[i]  = masses[i].y0;
+                starVX[i] = masses[i].vx;
+                starVY[i] = masses[i].vy;
+            }
+
             // Crossing detection remains relative to the original green S->E
             // baseline so we can measure distance to Earth where the trajectory
             // re-crosses that line.
@@ -2027,34 +2442,62 @@ class GameScene extends Phaser.Scene {
             const trajectoryPoints = [{ x: Sx, y: Sy }];
 
             for (let step = 0; step < maxSteps; step++) {
-                // Sum gravity from all massive objects.
+                // 1) Accumulate rocket acceleration + track closest-approach
+                //    using current star positions.
                 let ax = 0;
                 let ay = 0;
-                for (const m of masses) {
-                    const Cx = m.obj.x;
-                    const Cy = m.obj.y;
-                    const dxCS = Cx - x;
-                    const dyCS = Cy - y;
+                for (let i = 0; i < N; i++) {
+                    const dxCS = starX[i] - x;
+                    const dyCS = starY[i] - y;
                     const r2 = dxCS * dxCS + dyCS * dyCS;
                     const r = Math.sqrt(r2);
                     if (r > 1) {
-                        const g = m.mu / r2;
+                        const g = masses[i].mu / r2;
                         ax += (dxCS / r) * g;
                         ay += (dyCS / r) * g;
                     }
-
-                    // Track closest approach to any mass.
                     if (r2 < minDist2) {
                         minDist2 = r2;
                         periX = x;
                         periY = y;
                         periIndex = trajectoryPoints.length - 1;
-                        closestObj = m.obj;
+                        closestObj = masses[i].obj;
                     }
                 }
 
+                // 2) Accumulate pairwise star-on-star accelerations at the
+                //    current time step. Each star's mu is the gravitational
+                //    parameter (G*M) that ANOTHER body would feel from it, so
+                //    star i's acceleration from star j uses masses[j].mu.
+                for (let i = 0; i < N; i++) { starAX[i] = 0; starAY[i] = 0; }
+                for (let i = 0; i < N; i++) {
+                    for (let j = i + 1; j < N; j++) {
+                        const dxij = starX[j] - starX[i];
+                        const dyij = starY[j] - starY[i];
+                        const r2ij = dxij * dxij + dyij * dyij;
+                        const rij  = Math.sqrt(r2ij);
+                        if (rij > 1) {
+                            const gj = masses[j].mu / r2ij; // accel on i from j
+                            const gi = masses[i].mu / r2ij; // accel on j from i
+                            const ux = dxij / rij;
+                            const uy = dyij / rij;
+                            starAX[i] += ux * gj;
+                            starAY[i] += uy * gj;
+                            starAX[j] -= ux * gi;
+                            starAY[j] -= uy * gi;
+                        }
+                    }
+                }
+
+                // 3) Symplectic-Euler update: velocities first, then positions.
                 vx += ax * dt;
                 vy += ay * dt;
+                for (let i = 0; i < N; i++) {
+                    starVX[i] += starAX[i] * dt;
+                    starVY[i] += starAY[i] * dt;
+                    starX[i]  += starVX[i] * dt;
+                    starY[i]  += starVY[i] * dt;
+                }
 
                 x += vx * dt;
                 y += vy * dt;
@@ -2499,22 +2942,20 @@ class GameScene extends Phaser.Scene {
         const Sy = this.startY;
         const Ex = this.earthX;
         const Ey = this.earthY;
-        const star = (this.gravityObjects && this.gravityObjects[0]) || null;
-        const starX = star ? star.x : null;
-        const starY = star ? star.y : null;
+        const stars = (this.gravityObjects || []).filter(o => o);
         const shipX = this.player ? this.player.x : null;
         const shipY = this.player ? this.player.y : null;
 
-        // Compute world-space bounds spanning start, Earth, and star.
+        // Compute world-space bounds spanning start, Earth, and every star.
         // (Ship is included too so the ship dot stays on-map even if the
-        // trajectory strays outside the S-Earth-Star bounding box.)
+        // trajectory strays outside the S-Earth-stars bounding box.)
         let minX = Math.min(Sx, Ex);
         let maxX = Math.max(Sx, Ex);
         let minY = Math.min(Sy, Ey);
         let maxY = Math.max(Sy, Ey);
-        if (starX !== null) {
-            minX = Math.min(minX, starX); maxX = Math.max(maxX, starX);
-            minY = Math.min(minY, starY); maxY = Math.max(maxY, starY);
+        for (const s of stars) {
+            minX = Math.min(minX, s.x); maxX = Math.max(maxX, s.x);
+            minY = Math.min(minY, s.y); maxY = Math.max(maxY, s.y);
         }
         if (shipX !== null) {
             minX = Math.min(minX, shipX); maxX = Math.max(maxX, shipX);
@@ -2584,10 +3025,10 @@ class GameScene extends Phaser.Scene {
             g.strokePath();
         }
 
-        // Star (yellow filled circle, scaled physical radius clamped).
-        if (starX !== null) {
-            const sp = toMap(starX, starY);
-            const sr = Math.max(3, Math.min(10, (star.radius || 0) * scale));
+        // Stars (yellow filled circles, scaled physical radius clamped).
+        for (const s of stars) {
+            const sp = toMap(s.x, s.y);
+            const sr = Math.max(3, Math.min(10, (s.radius || 0) * scale));
             g.fillStyle(0xffdd33, 1.0);
             g.fillCircle(sp.x, sp.y, sr);
         }
@@ -2732,7 +3173,13 @@ class GameScene extends Phaser.Scene {
         // Only build a masses list if there are any; otherwise the prediction
         // is a straight line and we can skip the per-step gravity sum.
         const masses = (this.gravityObjects || [])
-            .map(o => ({ x: o.x, y: o.y, mu: o.getData('gravityStrength') }))
+            .map(o => ({
+                x: o.x,
+                y: o.y,
+                vx: (o.body && typeof o.body.velocity.x === 'number') ? o.body.velocity.x : 0,
+                vy: (o.body && typeof o.body.velocity.y === 'number') ? o.body.velocity.y : 0,
+                mu: o.getData('gravityStrength')
+            }))
             .filter(m => typeof m.mu === 'number' && m.mu > 0);
 
         // Prediction horizon and integration step. 10 s horizon at 20 ms
@@ -2771,6 +3218,13 @@ class GameScene extends Phaser.Scene {
                     ax += (dxG / r) * gAcc;
                     ay += (dyG / r) * gAcc;
                 }
+            }
+
+            // Advance each mass by its own velocity so the prediction accounts
+            // for star drift over the 10 s horizon.
+            for (let m = 0; m < masses.length; m++) {
+                masses[m].x += masses[m].vx * dt;
+                masses[m].y += masses[m].vy * dt;
             }
 
             vx += ax * dt;
@@ -3151,6 +3605,18 @@ class GameScene extends Phaser.Scene {
                 this.autopilot.enabled = true;
             }
         }
+
+        // Kick off star (mass) motion the moment the sweep is done in
+        // AUTOPILOT / TEST modes, or immediately in MANUAL mode. This aligns
+        // "star t=0" with "ship launch time", matching the sweep's
+        // assumptions.
+        if (!this.starMotionStarted && !this.slingshotSweepActive) {
+            this.startStarMotion();
+        }
+
+        // Per-frame pairwise star-on-star gravity (N-body). No-op until
+        // startStarMotion has run.
+        this.updateStarGravity(delta);
 
         // Update autopilot (if enabled, it will override manual controls)
         if (this.autopilot.enabled) {
