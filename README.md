@@ -4,7 +4,7 @@
 
 ## What it is
 
-A single-file 2D space game where the player (or an autopilot) flies a ship from a random starting point to Earth across a large 2D world, threading through a small cluster of massive stars that pull on the ship and on each other. Time dilation is simulated: the ship's onboard clock runs slower than Earth's when moving fast or deep in a star's gravity well.
+A single-file 2D space game where the player (or an autopilot) flies a ship from a random starting point to Earth across a large 2D world, threading through a small cluster of massive stars (and optionally black holes) that pull on the ship and on each other. Special and general relativity are simulated end-to-end: the ship's onboard clock runs slower than Earth's when moving fast or deep in a gravity well, and the visible starfield is Doppler-shifted, relativistically aberrated, and intensity-beamed by the ship's velocity.
 
 ## How to run
 
@@ -28,8 +28,10 @@ The file loads Phaser 3.60 from the jsDelivr CDN, so an internet connection is r
 ## HUD & overlays
 
 - Top-left: fuel, ammo, distance, radial/tangential velocities, attitude error, phase, etc.
+- Below that: **Time-dilation panel** showing your clock, Earth's clock, current γ (Lorentz factor), and — when the Earth-time deadline is enabled — a color-coded Earth-time budget bar.
 - Bottom-left: **Trajectory Map** — a large minimap showing the start point, Earth, every star (with live positions), the planned red trajectory, a dashed cyan free-fall ghost, and the ship's live position along the plan.
 - Top-right (after a run finishes): **Retry Same Seed** / **New Seed** buttons.
+- **Background starfield**: not static. At non-trivial velocity, stars are pulled toward the direction of motion (relativistic aberration), color-shifted (blue ahead / red behind), and re-brightened (relativistic beaming). At β > 0.9 the effect is dramatic.
 
 ## Star system
 
@@ -45,13 +47,16 @@ That Earth-clearance filter (on both position and velocity) is what lets us safe
 - **Numerical slingshot planner (N-body aware).** For AUTOPILOT / TEST runs, the game sweeps candidate departure angles in two cones on either side of the straight start→Earth line. Each candidate integrates the ship's trajectory alongside the full moving, gravitationally-interacting star cluster. It picks the fastest candidate whose intercept lands within the Earth-radius circle, and a finer refinement sweep tightens the winning angle.
 - **Aligned launch + minimal ORIENT.** The ship spawns pre-aligned along the S-E baseline. The autopilot's ORIENT phase runs a single bang-bang attitude schedule (usually trivially short) and immediately hands off to BOOST; any residual attitude error is trimmed by the CRUISE PID controller in flight.
 - **Retry same seed.** After a run, the exact start position, Earth position, and every star's `(x0, y0, vx, vy)` are snapshotted. "Retry Same Seed" reproduces the identical world; "New Seed" re-randomizes.
-- **Relativistic clocks.** Ship time advances more slowly than Earth time as a function of velocity and gravitational potential. Both are shown on the HUD, and the "time lost" delta is reported at the end of successful runs.
+- **Relativistic clocks.** Ship time advances more slowly than Earth time as a function of velocity and gravitational potential. Both are shown on the HUD, and the "time lost" delta is reported at the end of successful runs. Game-unit speed of light is `c = 400`, so cruise speeds put you well into relativistic territory (β = 0.5 at cruise 200, β ≈ 0.975 at the vCruise maximum).
+- **Relativistic visuals.** The rendered starfield each frame applies 2D relativistic aberration (`u′_∥ = (u_∥ + β)/(1 + β u_∥)`), Doppler color shift, and intensity beaming (`I ∝ D³`) based on the ship's current velocity.
+- **Earth-time deadline (opt-in).** Toggle in the mode-select menu. When on, the ship must reach Earth within an Earth-frame time budget of `mult × (dist_S_to_E / vCruise)` (default multiplier 1.5). The budget bar is shown on the HUD; missing it is a hard loss. Gives real gameplay weight to the time-dilation mechanic: gravity dilation and slow trajectories both eat into your deadline, so the two clocks become an actual tradeoff instead of ambient decoration.
+- **Optional black holes.** Toggleable in the menu. Contribute strongly to gravitational time dilation near the event horizon; grazing passes routinely produce γ > 5.
 
 ## Files
 
 The entire game lives in a single file:
 
-- `space-game.html` — HTML shell, inline CSS, and inline Phaser scene (~4500 lines of JS).
+- `space-game.html` — HTML shell, inline CSS, and inline Phaser scene (~5000 lines of JS).
 
 That's the whole project. No other files are required.
 

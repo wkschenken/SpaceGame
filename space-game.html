@@ -65,7 +65,11 @@
         kiLateral: 0.13,
         kdLateral: 0.44,
         maxLateralAccel: 100,
-        Isp: 250
+        Isp: 250,
+        // Earth-time deadline multiplier: deadline = mult * (distSE / vCruise).
+        // 1.5 gives ~50% slack over the ballistic-minimum trip time. Only used
+        // when the deadline toggle is on in the world-options menu.
+        earthDeadlineMult: 1.5
     };
 
     // Rocket-equation constants, power-limited engine model.
@@ -133,7 +137,8 @@
             kiLateral: src.kiLateral,
             kdLateral: src.kdLateral,
             maxLateralAccel: src.maxLateralAccel,
-            Isp: (typeof src.Isp === 'number' ? src.Isp : 300)
+            Isp: (typeof src.Isp === 'number' ? src.Isp : 300),
+            earthDeadlineMult: (typeof src.earthDeadlineMult === 'number' ? src.earthDeadlineMult : 1.5)
         };
     }
 
@@ -148,6 +153,10 @@
     let globalEnableMassiveObjects = false;
     let globalEnableAsteroids = false;
     let globalEnableTokens = false;
+    // If true, the ship must reach Earth within a time budget (in Earth-frame
+    // seconds) proportional to (dist_S_to_E / vCruise) * earthDeadlineMult.
+    // Missing the deadline is a hard loss.
+    let globalEarthDeadlineEnabled = false;
 
     const TUNING_STORAGE_KEY = 'spaceGameTuning_v1';
 
@@ -186,7 +195,8 @@
     loadTuningFromStorage();
 
     const tuningParamsDefinition = [
-        { key: 'vCruise',       label: 'Cruise speed',                 step: 10,   min: 50,   max: 400,  decimals: 0 },
+        { key: 'vCruise',       label: 'Cruise speed',                 step: 10,   min: 50,   max: 390,  decimals: 0 },
+        { key: 'earthDeadlineMult', label: 'Earth deadline multiplier',step: 0.1,  min: 0.5,  max: 5.0,  decimals: 1 },
         { key: 'brakeDistScale',label: 'Brake distance scale',         step: 0.05, min: 0.1,  max: 5.0,  decimals: 2 },
         { key: 'kpAngle',       label: 'ORIENT kp',                    step: 0.2,  min: 0.0,  max: 50.0, decimals: 2 },
         { key: 'kdAngle',       label: 'ORIENT kd',                    step: 0.1,  min: 0.0,  max: 50.0, decimals: 2 },
@@ -1303,6 +1313,15 @@ class GameScene extends Phaser.Scene {
         this.shipTime = 0;
         this.earthTime = 0;
         this.currentDilation = 1.0;  // ship-clock rate divided by Earth-clock rate
+        // Earth-time deadline state: computed in create() after start/Earth
+        // positions are known. earthDeadlineArmed is false until the ship
+        // first exceeds a small speed threshold, at which point the countdown
+        // starts (this way the autopilot planning phase does not eat into
+        // the player's budget).
+        this.earthDeadline = 0;
+        this.earthDeadlineArmed = false;
+        this.earthDeadlineFired = false;
+        this.earthTimeAfterArm = 0;
         this.fuel = 100;
         this.ammo = 50;
         this.gameOver = false;
@@ -1346,7 +1365,20 @@ class GameScene extends Phaser.Scene {
         }
         this.createPlayer();
         this.createEarth();
-        
+
+        // Compute Earth-time deadline (used only if the global toggle is on).
+        // Formula: deadline = mult * distSE / vCruise -- i.e. mult times the
+        // "ballistic minimum" trip time. Countdown starts when the ship first
+        // moves (see updateTime), so autopilot planning time doesn't count.
+        {
+            const _dxSE = this.earthX - this.startX;
+            const _dySE = this.earthY - this.startY;
+            const _distSE = Math.sqrt(_dxSE * _dxSE + _dySE * _dySE);
+            const _vCruise = Math.max(1, activeTuningParams.vCruise);
+            const _mult = Math.max(0.1, activeTuningParams.earthDeadlineMult || 1.5);
+            this.earthDeadline = (_distSE / _vCruise) * _mult;
+        }
+
         // Create obstacles
         this.createAsteroids();
         this.createGravityObjects();
@@ -1444,16 +1476,28 @@ class GameScene extends Phaser.Scene {
         this.bgStars = [];
         for (let i = 0; i < count; i++) {
             const bright = Math.random() < 0.05;
+            const bx = Math.random() * camW;
+            const by = Math.random() * camH;
+            const col = pickColor();
             this.bgStars.push({
-                x: Math.random() * camW,
-                y: Math.random() * camH,
+                // baseX/baseY: rest-frame screen position. drawBackground
+                // computes an aberration-shifted x/y from these each frame.
+                baseX: bx,
+                baseY: by,
+                x: bx,
+                y: by,
                 size: bright
                     ? Math.random() * 1.5 + 1.8
                     : Math.random() * 1.4 + 0.4,
                 alpha: bright
                     ? Math.random() * 0.3 + 0.7
                     : Math.random() * 0.55 + 0.25,
-                color: pickColor(),
+                // baseR/G/B: unpacked rest-frame color channels used to
+                // re-tint the star each frame under relativistic Doppler.
+                baseR: (col >> 16) & 0xff,
+                baseG: (col >> 8) & 0xff,
+                baseB: col & 0xff,
+                color: col,
                 bright,
                 twinkleFreq: 0.5 + Math.random() * 2.5,
                 twinklePhase: Math.random() * Math.PI * 2
@@ -3601,6 +3645,9 @@ class GameScene extends Phaser.Scene {
         this.earthClockLabel.setText('EARTH CLOCK');
         this.earthClockText = mkText(22, '#88bbff', true);
         this.dilationText = mkText(14, '#ffffff', true);
+        // Earth-time budget readout, populated only when the deadline toggle
+        // is on. Sits below the dilationText.
+        this.earthBudgetText = mkText(13, '#88bbff', true);
         
         // Instructions
         this.add.text(
@@ -3632,7 +3679,7 @@ class GameScene extends Phaser.Scene {
         const centerY = h / 2;
 
         // Panel large enough to hold title, a "World options" section with
-        // three checkboxes, a "Mode" section with four buttons, and margins.
+        // four checkboxes, a "Mode" section with four buttons, and margins.
         const panelWidth = 580;
         const panelHeight = 540;
         const bg = this.add.rectangle(centerX, centerY, panelWidth, panelHeight, 0x000000, 0.85)
@@ -3671,6 +3718,11 @@ class GameScene extends Phaser.Scene {
                 text: 'Tokens (fuel & ammo pickups)',
                 getter: () => globalEnableTokens,
                 setter: (v) => { globalEnableTokens = v; }
+            },
+            {
+                text: 'Earth-time deadline (hard loss if exceeded)',
+                getter: () => globalEarthDeadlineEnabled,
+                setter: (v) => { globalEarthDeadlineEnabled = v; }
             }
         ];
 
@@ -3970,6 +4022,10 @@ class GameScene extends Phaser.Scene {
         this.drawSlingshotDebug();
 
         // Bottom-left trajectory minimap.
+        // Relativistic background re-render (aberration + Doppler shift by
+        // current ship velocity). Static when the ship is stationary.
+        this.drawBackground();
+
         this.drawMinimap();
 
         // Draw predicted free-fall trajectory ghost (thrust-free forecast).
@@ -4138,38 +4194,111 @@ class GameScene extends Phaser.Scene {
     }
 
     drawBackground() {
-        // Static single-pass render: called once from createBackground and
-        // never again. Nebula clouds are painted first (behind), then the
-        // colored bg stars, then diffraction spikes on the brightest ones.
-        // No twinkle and no dynamic gravitational-lensing displacement, so
-        // the starfield contributes zero per-frame render cost.
+        // Per-frame render with relativistic aberration and Doppler shift:
+        // when the ship is moving, background stars appear compressed toward
+        // the direction of motion (aberration / "headlight effect") and are
+        // color-shifted by the observer's velocity (blueshift ahead, redshift
+        // behind, plus intensity beaming). At beta ~= 0 the render reduces
+        // to the original static starfield.
         this.bg.clear();
 
-        // Nebula clouds (behind stars). Three concentric alpha-stacked layers
-        // give a smooth radial falloff.
+        // Read ship velocity to derive beta and the velocity direction (v_hat).
+        let vx = 0, vy = 0;
+        if (this.player && this.player.body) {
+            vx = this.player.body.velocity.x;
+            vy = this.player.body.velocity.y;
+        }
+        const speed = Math.sqrt(vx * vx + vy * vy);
+        const cLight = 400;                             // must match updateTime
+        let beta = Math.min(0.995, speed / cLight);
+        if (!Number.isFinite(beta) || beta < 0) beta = 0;
+        const gamma = 1 / Math.sqrt(Math.max(1e-6, 1 - beta * beta));
+        const oneMinusBeta2Sqrt = Math.sqrt(1 - beta * beta);
+        const vHatX = speed > 1e-6 ? vx / speed : 1;
+        const vHatY = speed > 1e-6 ? vy / speed : 0;
+
+        const camW = this.cameras.main.width;
+        const camH = this.cameras.main.height;
+        const cx = camW / 2, cy = camH / 2;
+
+        // 2D relativistic aberration: transform a rest-frame unit direction
+        // (from ship to star) into the moving-observer frame. Star angular
+        // positions get pulled toward v_hat (Terrell rotation in 2D).
+        //   u'_parallel      = (u_par + beta) / (1 + beta * u_par)
+        //   u'_perp          = u_perp * sqrt(1 - beta^2) / (1 + beta * u_par)
+        // Doppler factor (blueshift forward, redshift behind):
+        //   D = gamma * (1 + beta * u'_par)
+        const aberrate = (px, py) => {
+            const dx = px - cx;
+            const dy = py - cy;
+            const r = Math.sqrt(dx * dx + dy * dy);
+            if (r < 1e-6 || beta < 1e-4) {
+                return { x: px, y: py, D: 1 };
+            }
+            const ux = dx / r;
+            const uy = dy / r;
+            // Decompose into v_hat parallel + perpendicular components.
+            const uPar = ux * vHatX + uy * vHatY;
+            const perpX = ux - uPar * vHatX;
+            const perpY = uy - uPar * vHatY;
+            const denom = 1 + beta * uPar;
+            const uParNew = (uPar + beta) / denom;
+            const scalePerp = oneMinusBeta2Sqrt / denom;
+            const uxNew = uParNew * vHatX + perpX * scalePerp;
+            const uyNew = uParNew * vHatY + perpY * scalePerp;
+            // Reconstruct screen position at the same radial distance from
+            // screen center (a reasonable simplification for a 2D projection).
+            const D = gamma * (1 + beta * uParNew);
+            return { x: cx + uxNew * r, y: cy + uyNew * r, D };
+        };
+
+        // Nebula clouds (behind stars). Aberrated but not Doppler-tinted:
+        // gas clouds are broad-spectrum and would washing-out any tint.
         for (const n of this.bgNebulas) {
+            const ab = aberrate(n.x, n.y);
             for (let ring = 3; ring >= 1; ring--) {
                 const rr = n.r * (ring / 3);
                 const a = n.alpha * (ring === 1 ? 1.5 : (ring === 2 ? 0.8 : 0.35));
                 const c = (ring === 1) ? n.colorInner : n.colorOuter;
                 this.bg.fillStyle(c, a);
-                this.bg.fillCircle(n.x, n.y, rr);
+                this.bg.fillCircle(ab.x, ab.y, rr);
             }
         }
 
-        // Bg stars with optional diffraction spikes.
+        // Bg stars: aberrated positions, Doppler-tinted colors and intensities.
         for (const star of this.bgStars) {
-            this.bg.fillStyle(star.color, star.alpha);
-            this.bg.fillCircle(star.x, star.y, star.size);
+            const ab = aberrate(star.baseX, star.baseY);
+            let r255 = star.baseR;
+            let g255 = star.baseG;
+            let b255 = star.baseB;
+            let alpha = star.alpha;
+            if (beta >= 1e-4) {
+                // Color temperature shift: exaggerated by ^1.2 for visibility.
+                // D > 1 (blueshift): boost B, drop R. D < 1: reverse.
+                const D = ab.D;
+                const p = 1.2;
+                const bScale = Math.pow(D, p);
+                const rScale = 1 / bScale;
+                r255 = Math.max(0, Math.min(255, star.baseR * rScale));
+                g255 = Math.max(0, Math.min(255, star.baseG));
+                b255 = Math.max(0, Math.min(255, star.baseB * bScale));
+                // Relativistic beaming: forward-boosted stars brighter, aft
+                // stars dimmer. I ~ D^3 (softer than the true D^4 bolometric
+                // scaling so faint stars don't vanish entirely astern).
+                alpha = Math.max(0.02, Math.min(1.0, star.alpha * Math.pow(D, 3)));
+            }
+            const packedColor = (Math.round(r255) << 16) | (Math.round(g255) << 8) | Math.round(b255);
+            this.bg.fillStyle(packedColor, alpha);
+            this.bg.fillCircle(ab.x, ab.y, star.size);
 
             if (star.bright) {
                 const spikeLen = star.size * 5;
-                this.bg.lineStyle(1, star.color, star.alpha * 0.35);
+                this.bg.lineStyle(1, packedColor, alpha * 0.35);
                 this.bg.beginPath();
-                this.bg.moveTo(star.x - spikeLen, star.y);
-                this.bg.lineTo(star.x + spikeLen, star.y);
-                this.bg.moveTo(star.x, star.y - spikeLen);
-                this.bg.lineTo(star.x, star.y + spikeLen);
+                this.bg.moveTo(ab.x - spikeLen, ab.y);
+                this.bg.lineTo(ab.x + spikeLen, ab.y);
+                this.bg.moveTo(ab.x, ab.y - spikeLen);
+                this.bg.lineTo(ab.x, ab.y + spikeLen);
                 this.bg.strokePath();
             }
         }
@@ -4302,7 +4431,11 @@ class GameScene extends Phaser.Scene {
         
         // Clamp gravitational potential to avoid extreme values
         gravitationalPotential = Math.min(gravitationalPotential, 200000);
-        let gravitationalDilation = 1 / Math.sqrt(1 + gravitationalPotential / 50000);
+        // Denominator scaled with c^2 (halved c => quartered c^2 => quartered
+        // scale). Together with the c=400 change below, close-approach passes
+        // to stars and grazing black holes now produce visible dilation
+        // (gamma factors of 2-5+) instead of ambient decoration.
+        let gravitationalDilation = 1 / Math.sqrt(1 + gravitationalPotential / 12500);
         if (!Number.isFinite(gravitationalDilation) || gravitationalDilation <= 0) {
             gravitationalDilation = 0.1;
         }
@@ -4311,7 +4444,10 @@ class GameScene extends Phaser.Scene {
             this.player.body.velocity.x ** 2 + 
             this.player.body.velocity.y ** 2
         );
-        const c = 800;
+        // Speed of light in game units. Lowered from 800 to 400 to bring the
+        // relativistic regime into normal play: at vCruise=200, beta=0.5
+        // (gamma ~1.15); at vCruise max 390, beta=0.975 (gamma ~4.5).
+        const c = 400;
         let beta2 = (speed / c) * (speed / c);
         if (!Number.isFinite(beta2) || beta2 < 0) {
             beta2 = 0;
@@ -4324,6 +4460,25 @@ class GameScene extends Phaser.Scene {
 
         this.shipTime += (delta / 1000) * timeDilation;
         this.earthTime += delta / 1000;
+
+        // Earth-time deadline (only when the global toggle is on and the
+        // game isn't already over). Arm the countdown the first time the
+        // ship exceeds a small speed threshold, then track elapsed Earth
+        // time after arming and hard-fail if it exceeds the budget.
+        if (globalEarthDeadlineEnabled && !this.gameOver && !this.earthDeadlineFired) {
+            if (!this.earthDeadlineArmed) {
+                if (speed > 5) {
+                    this.earthDeadlineArmed = true;
+                    this.earthTimeAfterArm = 0;
+                }
+            } else {
+                this.earthTimeAfterArm += delta / 1000;
+                if (this.earthTimeAfterArm > this.earthDeadline) {
+                    this.earthDeadlineFired = true;
+                    this.loseGame('DEADLINE');
+                }
+            }
+        }
     }
 
     updateUI() {
@@ -4401,13 +4556,15 @@ class GameScene extends Phaser.Scene {
     }
     
     updateTimeDilationHUD() {
-        // Layout: 380x160 panel below the top-left statsText. The panel is
+        // Layout: 380-wide panel below the top-left statsText. The panel is
         // split vertically into two clock columns (ship left, Earth right)
-        // with a dilation-factor + gap readout below.
+        // with a dilation-factor readout below, plus an optional Earth-time
+        // budget bar when the deadline toggle is on.
         const px = 10;
         const py = 260;
         const pw = 380;
-        const ph = 84;
+        const showBudget = !!globalEarthDeadlineEnabled;
+        const ph = showBudget ? 128 : 84;
 
         const dil = this.currentDilation || 1.0;
         // Gamma: how much faster the Earth clock runs vs. the ship clock.
@@ -4458,6 +4615,55 @@ class GameScene extends Phaser.Scene {
             .setPosition(px + pw / 2, py + 60)
             .setText(`γ = ${gamma.toFixed(2)}×   ship / earth clock rate = ${dil.toFixed(3)}`)
             .setFill(dilFill);
+
+        if (!showBudget) {
+            if (this.earthBudgetText) this.earthBudgetText.setText('');
+            return;
+        }
+
+        // Earth-time budget bar: filled proportion = used / total. Colored
+        // by remaining fraction (green > 50%, yellow > 25%, orange > 10%,
+        // flashing red < 10%).
+        const total = Math.max(0.001, this.earthDeadline || 0);
+        const used = Math.min(total, Math.max(0, this.earthTimeAfterArm || 0));
+        const remaining = Math.max(0, total - used);
+        const frac = used / total;
+        const remainFrac = 1 - frac;
+
+        let barColor = 0x66cc66;
+        let textFill = '#aaffaa';
+        if (remainFrac < 0.10) {
+            const flash = (Math.sin(this.time.now * 0.012) > 0);
+            barColor = flash ? 0xff2222 : 0xaa0000;
+            textFill = '#ff5555';
+        } else if (remainFrac < 0.25) {
+            barColor = 0xff8844;
+            textFill = '#ffaa66';
+        } else if (remainFrac < 0.50) {
+            barColor = 0xdddd44;
+            textFill = '#ffff88';
+        }
+
+        // Bar geometry: full width inside panel padding, sits at py+82.
+        const barX = px + 16;
+        const barY = py + 92;
+        const barW = pw - 32;
+        const barH = 12;
+        g.fillStyle(0x222222, 0.9);
+        g.fillRect(barX, barY, barW, barH);
+        g.fillStyle(barColor, 0.95);
+        g.fillRect(barX, barY, barW * frac, barH);
+        g.lineStyle(1, 0xffffff, 0.4);
+        g.strokeRect(barX, barY, barW, barH);
+
+        const armed = !!this.earthDeadlineArmed;
+        const label = armed
+            ? `EARTH BUDGET  ${used.toFixed(1)}s / ${total.toFixed(1)}s   (${remaining.toFixed(1)}s left)`
+            : `EARTH BUDGET  ${total.toFixed(1)}s  (starts on first move)`;
+        this.earthBudgetText
+            .setPosition(px + pw / 2, py + 108)
+            .setText(label)
+            .setFill(textFill);
     }
 
     drawAutopilotControls() {
@@ -4669,9 +4875,10 @@ class GameScene extends Phaser.Scene {
         this.ammo = Math.min(this.ammo + 20, 50);
     }
 
-    loseGame() {
+    loseGame(reason) {
         if (this.gameOver) return;
         this.gameOver = true;
+        this.lastLoseReason = reason || 'COLLISION';
 
         // Record experiment failure if enabled
         if (experimentConfig.enabled && !experimentConfig.finished) {
@@ -4695,7 +4902,10 @@ class GameScene extends Phaser.Scene {
 
         this.player.body.setVelocity(0, 0);
         
-        const msg = this.add.text(600, 400, 'COLLISION!\n\nPress R to Restart', {
+        const headline = (this.lastLoseReason === 'DEADLINE')
+            ? 'EARTH DEADLINE EXCEEDED'
+            : 'COLLISION!';
+        const msg = this.add.text(600, 400, headline + '\n\nPress R to Restart', {
             fontSize: '48px',
             fill: '#f00',
             align: 'center',
