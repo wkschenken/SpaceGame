@@ -27,6 +27,14 @@
     <script>
     let bestEarthTime = null;
 
+    // Narrative scale for the time-dilation HUD and end-of-run summary. Each
+    // game-second of Earth-frame time is interpreted as this many Earth years
+    // for the purpose of dramatizing the relativistic gap between the ship
+    // clock and the Earth clock. Physics accumulators (shipTime / earthTime)
+    // remain in real game-seconds; the narrative multiplier is applied only
+    // when rendering "years elapsed" labels.
+    const TIME_NARRATIVE_YEARS_PER_SECOND = 1.0;
+
     const experimentConfig = {
         enabled: false,           // only enabled when "Test" mode is selected
         radius: 3000,             // radial distance from start to Earth
@@ -891,6 +899,18 @@ class AutopilotController {
                     }
                 }
 
+                // Total-speed floor: if the overall speed magnitude has decayed
+                // below 75% of vCruise (e.g., after a costly attitude wobble or
+                // an unfavorable gravity encounter), re-accelerate back up. This
+                // is a safety net that complements the along-path rule above,
+                // which only reacts to the projected component.
+                if (!thrust && speed < 0.75 * this.vCruise) {
+                    const alignedForBoost = Math.abs(angleError) < 0.3;
+                    if (alignedForBoost) {
+                        thrust = true;
+                    }
+                }
+
                 break;
             }
 
@@ -1282,6 +1302,7 @@ class GameScene extends Phaser.Scene {
         // Game state
         this.shipTime = 0;
         this.earthTime = 0;
+        this.currentDilation = 1.0;  // ship-clock rate divided by Earth-clock rate
         this.fuel = 100;
         this.ammo = 50;
         this.gameOver = false;
@@ -1329,6 +1350,7 @@ class GameScene extends Phaser.Scene {
         // Create obstacles
         this.createAsteroids();
         this.createGravityObjects();
+        this.createBlackHoles();
         this.createPickups();
         
         // Null out references to any per-scene graphics from a prior scene
@@ -1373,6 +1395,12 @@ class GameScene extends Phaser.Scene {
         // Collisions
         this.physics.add.overlap(this.player, this.earth, this.winGame, null, this);
         this.physics.add.collider(this.player, this.asteroids, this.loseGame, null, this);
+        // Contact with a black hole's event horizon is unrecoverable.
+        if (this.blackHoles && this.blackHoles.length) {
+            for (const bh of this.blackHoles) {
+                this.physics.add.overlap(this.player, bh, this.loseGame, null, this);
+            }
+        }
         this.physics.add.overlap(this.player, this.fuelPickups, this.collectFuel, null, this);
         this.physics.add.overlap(this.player, this.ammoPickups, this.collectAmmo, null, this);
         
@@ -1380,11 +1408,12 @@ class GameScene extends Phaser.Scene {
     }
 
     createBackground() {
-        // Create scrolling starfield. The starfield is fixed to the screen
-        // (setScrollFactor(0)) so it must cover the full camera viewport,
-        // whatever its size. Star count scales with viewport area so density
-        // stays roughly constant: 600 stars filled the old 1200x800 = 960000
-        // px^2 viewport, so we keep the same 600 / 960000 density here.
+        // Screen-fixed starfield. Star count scales with viewport area so
+        // density stays roughly constant: 600 stars filled the old 1200x800.
+        // Each star also carries a blackbody-inspired color, brightness tier
+        // (bright stars get diffraction spikes), and twinkle phase/frequency
+        // used by drawBackground. A few large low-alpha nebula clouds are
+        // rendered behind the starfield for depth.
         this.bg = this.add.graphics();
         this.bg.setScrollFactor(0);
 
@@ -1393,15 +1422,304 @@ class GameScene extends Phaser.Scene {
         const density = 600 / (1200 * 800);
         const count = Math.max(1, Math.round(density * camW * camH));
 
+        const starColors = [
+            0xaabfff, // hot blue-white (O/B)
+            0xffffff, // white (A)
+            0xfff4d6, // warm white (F)
+            0xffd88a, // yellow (G, sun-like)
+            0xff9955, // orange (K)
+            0xff6644  // red (M)
+        ];
+        const colorWeights = [0.05, 0.25, 0.30, 0.20, 0.13, 0.07];
+        const pickColor = () => {
+            const u = Math.random();
+            let acc = 0;
+            for (let i = 0; i < starColors.length; i++) {
+                acc += colorWeights[i];
+                if (u < acc) return starColors[i];
+            }
+            return starColors[starColors.length - 1];
+        };
+
         this.bgStars = [];
         for (let i = 0; i < count; i++) {
+            const bright = Math.random() < 0.05;
             this.bgStars.push({
                 x: Math.random() * camW,
                 y: Math.random() * camH,
-                size: Math.random() * 2 + 0.5,
-                alpha: Math.random() * 0.7 + 0.3
+                size: bright
+                    ? Math.random() * 1.5 + 1.8
+                    : Math.random() * 1.4 + 0.4,
+                alpha: bright
+                    ? Math.random() * 0.3 + 0.7
+                    : Math.random() * 0.55 + 0.25,
+                color: pickColor(),
+                bright,
+                twinkleFreq: 0.5 + Math.random() * 2.5,
+                twinklePhase: Math.random() * Math.PI * 2
             });
         }
+
+        // Soft nebula clouds for depth. Each blob is rendered as concentric
+        // filled circles of decreasing radius but increasing opacity, giving
+        // a smooth radial falloff without needing a shader.
+        const nebulaPalettes = [
+            [0x6633aa, 0x220844],
+            [0x2266cc, 0x081633],
+            [0xcc3366, 0x330a1c],
+            [0x33aa88, 0x082818]
+        ];
+        this.bgNebulas = [];
+        const nebCount = 3;
+        for (let i = 0; i < nebCount; i++) {
+            const pal = nebulaPalettes[Math.floor(Math.random() * nebulaPalettes.length)];
+            this.bgNebulas.push({
+                x: Math.random() * camW,
+                y: Math.random() * camH,
+                r: 200 + Math.random() * 300,
+                colorInner: pal[0],
+                colorOuter: pal[1],
+                alpha: 0.08 + Math.random() * 0.10
+            });
+        }
+
+        // Paint the starfield once; it stays static for the whole scene.
+        this.drawBackground();
+    }
+
+    generateEarthTexture(key, radius) {
+        // Procedurally paint an Earth-like planet into an offscreen canvas
+        // (oceans, continents, deserts, clouds, ice caps, day-night
+        // terminator, specular highlight). The resulting texture is then
+        // used as a sprite via add.image().
+        const size = Math.max(2, Math.ceil(radius * 2));
+        if (this.textures.exists(key)) this.textures.remove(key);
+        const tex = this.textures.createCanvas(key, size, size);
+        const ctx = tex.getContext();
+        const cx = size / 2, cy = size / 2;
+
+        // Ocean base with subtle sphere shading (limb darkening).
+        const oceanGrad = ctx.createRadialGradient(
+            cx * 0.7, cy * 0.7, radius * 0.1,
+            cx, cy, radius
+        );
+        oceanGrad.addColorStop(0.0, '#1e6dbf');
+        oceanGrad.addColorStop(0.85, '#0a3260');
+        oceanGrad.addColorStop(1.0, '#03152a');
+        ctx.fillStyle = oceanGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Clip to sphere for surface features.
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.995, 0, Math.PI * 2);
+        ctx.clip();
+
+        // Continent blobs (mix of green forests and tan deserts).
+        for (let i = 0; i < 60; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = Math.random() * radius * 0.9;
+            const px = cx + Math.cos(a) * r;
+            const py = cy + Math.sin(a) * r;
+            const sz = radius * (0.05 + Math.random() * 0.22);
+            const desert = Math.random() < 0.35;
+            if (desert) {
+                const rC = 180 + Math.floor(Math.random() * 40);
+                const gC = 140 + Math.floor(Math.random() * 40);
+                ctx.fillStyle = `rgba(${rC},${gC},60,0.98)`;
+            } else {
+                const gC = 90 + Math.floor(Math.random() * 60);
+                ctx.fillStyle = `rgba(${20 + Math.floor(Math.random() * 30)},${gC},${30 + Math.floor(Math.random() * 30)},0.98)`;
+            }
+            ctx.beginPath();
+            ctx.ellipse(
+                px, py, sz, sz * (0.4 + Math.random() * 0.9),
+                Math.random() * Math.PI * 2, 0, Math.PI * 2
+            );
+            ctx.fill();
+        }
+
+        // Cloud swirls.
+        for (let i = 0; i < 25; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = Math.random() * radius * 0.95;
+            const px = cx + Math.cos(a) * r;
+            const py = cy + Math.sin(a) * r;
+            const sz = radius * (0.08 + Math.random() * 0.22);
+            ctx.fillStyle = `rgba(255,255,255,${0.22 + Math.random() * 0.25})`;
+            ctx.beginPath();
+            ctx.ellipse(
+                px, py, sz, sz * 0.35,
+                Math.random() * Math.PI * 2, 0, Math.PI * 2
+            );
+            ctx.fill();
+        }
+
+        // Polar ice caps.
+        ctx.fillStyle = 'rgba(240,250,255,0.90)';
+        ctx.beginPath();
+        ctx.ellipse(cx, cy - radius * 0.88, radius * 0.55, radius * 0.18, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + radius * 0.88, radius * 0.55, radius * 0.18, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Day-night terminator shading (dark side offset up-left).
+        const shadow = ctx.createRadialGradient(
+            cx * 0.55, cy * 0.55, radius * 0.2,
+            cx, cy, radius
+        );
+        shadow.addColorStop(0.0, 'rgba(0,0,0,0)');
+        shadow.addColorStop(0.55, 'rgba(0,0,0,0)');
+        shadow.addColorStop(0.9, 'rgba(0,0,20,0.55)');
+        shadow.addColorStop(1.0, 'rgba(0,0,10,0.80)');
+        ctx.fillStyle = shadow;
+        ctx.fillRect(0, 0, size, size);
+
+        // Specular highlight on the day side.
+        const hi = ctx.createRadialGradient(
+            cx * 0.65, cy * 0.65, 0,
+            cx * 0.65, cy * 0.65, radius * 0.5
+        );
+        hi.addColorStop(0.0, 'rgba(255,255,255,0.18)');
+        hi.addColorStop(1.0, 'rgba(255,255,255,0)');
+        ctx.fillStyle = hi;
+        ctx.fillRect(0, 0, size, size);
+
+        ctx.restore();
+        tex.refresh();
+        return key;
+    }
+
+    generateBlackHoleTexture(key, radius) {
+        // Procedurally paint a black hole (jet-black event-horizon disk with
+        // a thin bright photon-sphere ring, wrapped in a diffuse orange
+        // accretion disk that fades outward). Padded so the accretion disk
+        // has room to bleed well outside the event-horizon radius.
+        const pad = Math.ceil(radius * 2.5);
+        const size = (Math.ceil(radius) + pad) * 2;
+        if (this.textures.exists(key)) this.textures.remove(key);
+        const tex = this.textures.createCanvas(key, size, size);
+        const ctx = tex.getContext();
+        const cx = size / 2, cy = size / 2;
+
+        // Outer accretion disk: hot orange fading out to transparent, drawn
+        // with an elliptical scaling to hint at a nearly-edge-on disk plane.
+        const outerR = radius + pad;
+        const diskGrad = ctx.createRadialGradient(
+            cx, cy, radius * 1.05,
+            cx, cy, outerR
+        );
+        diskGrad.addColorStop(0.00, 'rgba(255,220,150,0.85)');
+        diskGrad.addColorStop(0.15, 'rgba(255,140,50,0.70)');
+        diskGrad.addColorStop(0.45, 'rgba(220,80,20,0.35)');
+        diskGrad.addColorStop(0.80, 'rgba(120,30,10,0.12)');
+        diskGrad.addColorStop(1.00, 'rgba(60,10,5,0)');
+        ctx.save();
+        // Squish vertically to look like an inclined disk.
+        ctx.translate(cx, cy);
+        ctx.scale(1.0, 0.55);
+        ctx.translate(-cx, -cy);
+        ctx.fillStyle = diskGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, outerR, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+
+        // Photon-sphere ring: thin bright annulus at ~1.02R, before painting
+        // the event horizon on top.
+        ctx.strokeStyle = 'rgba(255,240,200,0.95)';
+        ctx.lineWidth = Math.max(1.5, radius * 0.04);
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 1.02, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Event horizon: solid jet-black disk. Painted last so it occludes
+        // the inner edge of the accretion disk and the photon ring behind it.
+        ctx.fillStyle = '#000000';
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        tex.refresh();
+        return key;
+    }
+
+    generateStarTexture(key, radius) {
+        // Procedurally paint a sun-like star (hot white-yellow disk with
+        // granulation cells, bright limb, and a soft outer corona) into an
+        // offscreen canvas. Padded so the diffuse corona has room to bleed
+        // outside the star's physical radius.
+        const pad = Math.ceil(radius * 0.7);
+        const size = (Math.ceil(radius) + pad) * 2;
+        if (this.textures.exists(key)) this.textures.remove(key);
+        const tex = this.textures.createCanvas(key, size, size);
+        const ctx = tex.getContext();
+        const cx = size / 2, cy = size / 2;
+
+        // Outer diffuse corona: red/orange fading to transparent.
+        const outerGrad = ctx.createRadialGradient(
+            cx, cy, radius * 0.95,
+            cx, cy, radius + pad
+        );
+        outerGrad.addColorStop(0.0, 'rgba(255,180,90,0.55)');
+        outerGrad.addColorStop(0.4, 'rgba(255,110,40,0.28)');
+        outerGrad.addColorStop(0.75, 'rgba(200,60,20,0.10)');
+        outerGrad.addColorStop(1.0, 'rgba(180,40,10,0)');
+        ctx.fillStyle = outerGrad;
+        ctx.fillRect(0, 0, size, size);
+
+        // Star disk: hot white core -> yellow -> orange edge.
+        const diskGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+        diskGrad.addColorStop(0.0, '#ffffee');
+        diskGrad.addColorStop(0.3, '#ffee99');
+        diskGrad.addColorStop(0.65, '#ffb033');
+        diskGrad.addColorStop(1.0, '#ff6600');
+        ctx.fillStyle = diskGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Granulation and hot spots, clipped to the disk.
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.98, 0, Math.PI * 2);
+        ctx.clip();
+        for (let i = 0; i < 90; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = Math.random() * radius * 0.94;
+            const px = cx + Math.cos(a) * r;
+            const py = cy + Math.sin(a) * r;
+            const sz = radius * (0.02 + Math.random() * 0.06);
+            ctx.fillStyle = `rgba(200,80,10,${0.12 + Math.random() * 0.22})`;
+            ctx.beginPath();
+            ctx.arc(px, py, sz, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        for (let i = 0; i < 25; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = Math.random() * radius * 0.9;
+            const px = cx + Math.cos(a) * r;
+            const py = cy + Math.sin(a) * r;
+            const sz = radius * (0.015 + Math.random() * 0.03);
+            ctx.fillStyle = `rgba(255,250,220,${0.4 + Math.random() * 0.4})`;
+            ctx.beginPath();
+            ctx.arc(px, py, sz, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
+
+        // Bright limb (thin highlight annulus at the very edge).
+        ctx.strokeStyle = 'rgba(255,240,180,0.55)';
+        ctx.lineWidth = Math.max(1, radius * 0.02);
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius * 0.99, 0, Math.PI * 2);
+        ctx.stroke();
+
+        tex.refresh();
+        return key;
     }
 
     initializeStartAndDestination() {
@@ -1560,7 +1878,6 @@ class GameScene extends Phaser.Scene {
     }
 
     createEarth() {
-        // Place Earth at right side, ensuring it's visible from start
         const earthX = this.earthX;
         const earthY = this.earthY;
 
@@ -1568,16 +1885,32 @@ class GameScene extends Phaser.Scene {
         const earthRadius = 80 * 5;
         const earthGlowRadius = 120 * 5;
 
-        this.earth = this.add.circle(earthX, earthY, earthRadius, 0x0088ff);
-        this.earth.setStrokeStyle(4, 0x00aaff);
-
-        // Add glow effect scaled with Earth radius.
-        this.earthGlow = this.add.circle(earthX, earthY, earthGlowRadius, 0x0088ff, 0.3);
-
+        // Physics/collision body (invisible so it doesn't render over the
+        // procedural sprite, but this.earth.radius and this.earth.body remain
+        // available to the planner, radar, phase logic, and overlap collider).
+        this.earth = this.add.circle(earthX, earthY, earthRadius, 0x000000, 0);
         this.physics.add.existing(this.earth);
         this.earth.body.setCircle(earthRadius);
         this.earth.body.setImmovable(true);
-        
+
+        // Layered atmospheric halo: several concentric filled circles with
+        // alpha falling off outward, giving a soft blue glow around the
+        // planet. Rendered before the sprite so the sprite covers the disk.
+        this.earthGlow = this.add.graphics();
+        this.earthGlow.setPosition(earthX, earthY);
+        const glowLayers = 6;
+        for (let i = glowLayers; i >= 1; i--) {
+            const t = i / glowLayers;
+            const rr = earthRadius + (earthGlowRadius - earthRadius) * t;
+            const a = 0.09 * (1 - i / (glowLayers + 2));
+            this.earthGlow.fillStyle(0x66bbff, a);
+            this.earthGlow.fillCircle(0, 0, rr);
+        }
+
+        // Procedural land/water/clouds/ice/terminator texture.
+        this.generateEarthTexture('earthTex', earthRadius);
+        this.earthSprite = this.add.image(earthX, earthY, 'earthTex');
+
         console.log('Earth created at:', earthX, earthY);
     }
 
@@ -1749,9 +2082,16 @@ class GameScene extends Phaser.Scene {
             this.worldSnapshot.stars = starList;
         }
 
+        // Procedural star texture generated once; all stars share it because
+        // they share physical parameters (radius / mu / mass).
+        const starTexKey = 'starTex';
+        this.generateStarTexture(starTexKey, starRadius);
+
         // Instantiate every star with identical physical parameters.
         for (const s of starList) {
-            const obj = this.add.circle(s.x0, s.y0, starRadius, 0xffaa00, 0.6);
+            // Invisible physics/collision body: preserves obj.radius, obj.body,
+            // and all planner / sweep / collision code paths.
+            const obj = this.add.circle(s.x0, s.y0, starRadius, 0xffaa00, 0);
             this.physics.add.existing(obj);
             obj.body.setCircle(starRadius);
             obj.body.setImmovable(true);
@@ -1762,7 +2102,183 @@ class GameScene extends Phaser.Scene {
             obj.setData('y0', s.y0);
             obj.setData('vx', s.vx);
             obj.setData('vy', s.vy);
+
+            // Visual sprite (procedural texture).
+            const sprite = this.add.image(s.x0, s.y0, starTexKey);
+            obj.setData('sprite', sprite);
+
+            // Corona / Einstein-ring / flame-tongue overlay, animated per
+            // frame. Additive blend so the semi-transparent orange layers
+            // brighten the underlying disk instead of darkening it.
+            const corona = this.add.graphics();
+            corona.setPosition(s.x0, s.y0);
+            corona.setBlendMode(Phaser.BlendModes.ADD);
+            obj.setData('corona', corona);
+            obj.setData('coronaSeed', Math.random() * 1000);
+
             this.gravityObjects.push(obj);
+        }
+    }
+
+    createBlackHoles() {
+        // Spawn one or more black holes into the world. Each BH is pushed
+        // into this.gravityObjects so the shared N-body integrator, planner,
+        // and per-frame gravity update all treat it uniformly with the stars.
+        // Distinguished from stars by:
+        //   - Higher gravitational parameter (mu) at a smaller visible radius.
+        //   - killRadius > 0 (the event horizon): trajectories that pass
+        //     within this radius are terminated as fatal in the planner, and
+        //     the runtime overlap collider ends the game.
+        //   - A distinct procedural texture (jet-black disk + accretion disk).
+        this.blackHoles = [];
+
+        if (!globalEnableMassiveObjects) {
+            return;
+        }
+
+        const Sx = this.startX;
+        const Sy = this.startY;
+        const Ex = this.earthX;
+        const Ey = this.earthY;
+        const dxSE = Ex - Sx;
+        const dySE = Ey - Sy;
+        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE) || 1;
+
+        const numBlackHoles  = 1;
+        const bhRadius       = 280;                 // visible event-horizon radius
+        // ~2x a star's mu (stars: 7.68e6) but concentrated inside a tighter
+        // radius, producing a much steeper gravity well near the BH.
+        const bhMu           = 15000000;
+        const bhMass         = 200;
+        // Distances the BH must respect at t=0.
+        const earthClear     = 12 * bhRadius;       // ~3360
+        const earthClear2    = earthClear * earthClear;
+        const shipClear      = 8  * bhRadius;       // ~2240
+        const shipClear2     = shipClear * shipClear;
+        // Keep BHs comfortably away from any existing star so the planner's
+        // sim doesn't have to deal with two intersecting gravity wells.
+        const starSep        = 6  * bhRadius;
+        const starSep2       = starSep * starSep;
+
+        const vCruiseClear   = (activeTuningParams && activeTuningParams.vCruise) || 200;
+        const clearHorizon   = 2.0 * lenSE / vCruiseClear;
+
+        const sampleGaussian = () => {
+            let u1 = Math.random();
+            const u2 = Math.random();
+            u1 = u1 < 1e-8 ? 1e-8 : u1;
+            return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+        };
+        const sampleVelocity = () => {
+            const a = Math.random() * Math.PI * 2;
+            const speed = Math.max(1, 150 + sampleGaussian() * 40);
+            return { vx: Math.cos(a) * speed, vy: Math.sin(a) * speed };
+        };
+        const clearsEarth = (px, py, vxB, vyB) => {
+            const relX = px - Ex, relY = py - Ey;
+            const relVX = vxB, relVY = vyB;
+            const vv = relVX * relVX + relVY * relVY;
+            let tStar = 0;
+            if (vv > 1e-9) {
+                tStar = -(relX * relVX + relY * relVY) / vv;
+                tStar = Math.max(0, Math.min(clearHorizon, tStar));
+            }
+            const cx = relX + relVX * tStar;
+            const cy = relY + relVY * tStar;
+            return (cx * cx + cy * cy) >= earthClear2;
+        };
+        const sampleVelocityClearingEarth = (px, py) => {
+            for (let k = 0; k < 40; k++) {
+                const v = sampleVelocity();
+                if (clearsEarth(px, py, v.vx, v.vy)) return v;
+            }
+            return { vx: 0, vy: 0 };
+        };
+
+        // Existing star positions at t=0 (avoid overlapping them).
+        const starPositions = (this.gravityObjects || []).map(o => ({
+            x: (typeof o.getData('x0') === 'number') ? o.getData('x0') : o.x,
+            y: (typeof o.getData('y0') === 'number') ? o.getData('y0') : o.y
+        }));
+
+        // Sample BH placements, or replay from snapshot on same-seed retry.
+        let bhList;
+        const snap = this.worldSnapshot && this.worldSnapshot.blackHoles;
+        const snapUsable = Array.isArray(snap) && snap.length > 0
+            && snap.every(b => typeof b.vx === 'number');
+        if (this.replayRequested && !experimentConfig.enabled && snapUsable) {
+            bhList = snap;
+        } else {
+            bhList = [];
+            const maxAttempts = 500;
+            for (let i = 0; i < numBlackHoles; i++) {
+                let placed = false;
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    const cx = Math.random() * this.worldWidth;
+                    const cy = Math.random() * this.worldHeight;
+
+                    const dxS = cx - Sx, dyS = cy - Sy;
+                    if (dxS * dxS + dyS * dyS < shipClear2) continue;
+                    const dxE = cx - Ex, dyE = cy - Ey;
+                    if (dxE * dxE + dyE * dyE < earthClear2) continue;
+
+                    let overlap = false;
+                    for (const p of starPositions) {
+                        const dx = cx - p.x, dy = cy - p.y;
+                        if (dx * dx + dy * dy < starSep2) { overlap = true; break; }
+                    }
+                    if (overlap) continue;
+                    for (const b of bhList) {
+                        const dx = cx - b.x0, dy = cy - b.y0;
+                        if (dx * dx + dy * dy < starSep2) { overlap = true; break; }
+                    }
+                    if (overlap) continue;
+
+                    const v = sampleVelocityClearingEarth(cx, cy);
+                    bhList.push({ x0: cx, y0: cy, vx: v.vx, vy: v.vy });
+                    placed = true;
+                    break;
+                }
+                if (!placed) break;
+            }
+            if (!this.worldSnapshot) this.worldSnapshot = {};
+            this.worldSnapshot.blackHoles = bhList;
+        }
+
+        // Procedural black-hole texture (shared across all BHs).
+        const bhTexKey = 'blackHoleTex';
+        this.generateBlackHoleTexture(bhTexKey, bhRadius);
+
+        for (const b of bhList) {
+            const obj = this.add.circle(b.x0, b.y0, bhRadius, 0x000000, 0);
+            this.physics.add.existing(obj);
+            obj.body.setCircle(bhRadius);
+            obj.body.setImmovable(true);
+            obj.setData('gravityStrength', bhMu);
+            obj.setData('schwarzschildRadius', bhRadius);
+            obj.setData('mass', bhMass);
+            // killRadius: contact with anything inside this radius is fatal.
+            // Read by the planner sim and by the runtime overlap collider.
+            obj.setData('killRadius', bhRadius);
+            obj.setData('isBlackHole', true);
+            obj.setData('x0', b.x0);
+            obj.setData('y0', b.y0);
+            obj.setData('vx', b.vx);
+            obj.setData('vy', b.vy);
+
+            const sprite = this.add.image(b.x0, b.y0, bhTexKey);
+            obj.setData('sprite', sprite);
+
+            // Rotating accretion-disk brightness overlay (animated per frame
+            // in the shared gravityObjects loop). Additive blend.
+            const overlay = this.add.graphics();
+            overlay.setPosition(b.x0, b.y0);
+            overlay.setBlendMode(Phaser.BlendModes.ADD);
+            obj.setData('accretionOverlay', overlay);
+            obj.setData('accretionSeed', Math.random() * 1000);
+
+            this.gravityObjects.push(obj);
+            this.blackHoles.push(obj);
         }
     }
 
@@ -1901,7 +2417,11 @@ class GameScene extends Phaser.Scene {
                 x0: (typeof o.getData('x0') === 'number') ? o.getData('x0') : o.x,
                 y0: (typeof o.getData('y0') === 'number') ? o.getData('y0') : o.y,
                 vx: (typeof o.getData('vx') === 'number') ? o.getData('vx') : 0,
-                vy: (typeof o.getData('vy') === 'number') ? o.getData('vy') : 0
+                vy: (typeof o.getData('vy') === 'number') ? o.getData('vy') : 0,
+                // Fatal contact radius (event horizon for black holes; 0 for
+                // regular stars, which are handled by the separate sunRadius
+                // clip filter downstream).
+                killR: (typeof o.getData('killRadius') === 'number') ? o.getData('killRadius') : 0
             }))
             .filter(m => typeof m.mu === 'number' && m.mu > 0);
         if (masses.length === 0) {
@@ -2213,6 +2733,7 @@ class GameScene extends Phaser.Scene {
                 //    using current star positions.
                 let ax = 0;
                 let ay = 0;
+                let killed = false;
                 for (let i = 0; i < N; i++) {
                     const dxCS = starX[i] - x;
                     const dyCS = starY[i] - y;
@@ -2230,6 +2751,26 @@ class GameScene extends Phaser.Scene {
                         periIndex = trajectoryPoints.length - 1;
                         closestObj = masses[i].obj;
                     }
+                    // Fatal contact: trajectories that reach within any mass's
+                    // event horizon are unrecoverable. Reject as miss so the
+                    // planner never selects them.
+                    if (masses[i].killR > 0 && r <= masses[i].killR) {
+                        killed = true;
+                    }
+                }
+                if (killed) {
+                    trajectoryPoints.push({ x, y });
+                    return {
+                        hit: false,
+                        miss: true,
+                        trajectoryPoints,
+                        periX,
+                        periY,
+                        periIndex,
+                        minDistToStar: Math.sqrt(minDist2),
+                        closestObj,
+                        killedByBlackHole: true
+                    };
                 }
 
                 // 2) Accumulate pairwise star-on-star accelerations at the
@@ -3037,6 +3578,26 @@ class GameScene extends Phaser.Scene {
         });
         this.statsText.setScrollFactor(0);
         this.statsText.setDepth(1000);
+
+        // Time-dilation dual-clock widget. Rendered below the stats readout
+        // and animated every frame by updateTimeDilationHUD.
+        this.timeDilationPanel = this.add.graphics()
+            .setScrollFactor(0)
+            .setDepth(1000);
+        const mkText = (fontSize, color, bold) => this.add.text(0, 0, '', {
+            fontSize: `${fontSize}px`,
+            fontStyle: bold ? 'bold' : 'normal',
+            fill: color,
+            align: 'center'
+        }).setScrollFactor(0).setDepth(1001).setOrigin(0.5, 0);
+        this.shipClockLabel = mkText(11, '#66ff88', true);
+        this.shipClockLabel.setText('YOUR CLOCK');
+        this.shipClockText = mkText(22, '#66ff88', true);
+        this.earthClockLabel = mkText(11, '#88bbff', true);
+        this.earthClockLabel.setText('EARTH CLOCK');
+        this.earthClockText = mkText(22, '#88bbff', true);
+        this.dilationText = mkText(14, '#ffffff', true);
+        this.timeGapText = mkText(12, '#ffcc66', false);
         
         // Instructions
         this.add.text(
@@ -3353,8 +3914,8 @@ class GameScene extends Phaser.Scene {
         // the slingshot planner, so there is no plan for the autopilot to
         // follow. Autopilot is now only active in AUTOPILOT / TEST modes.
         
-        // Draw background
-        this.drawBackground();
+        // Background starfield is rendered once at scene setup and left
+        // untouched thereafter (bgStars are screen-fixed and non-animated).
         
         // For AUTOPILOT and TEST modes, run the numerical slingshot sweep
         // first (if applicable), then enable and update autopilot.
@@ -3411,12 +3972,93 @@ class GameScene extends Phaser.Scene {
         // Draw predicted free-fall trajectory ghost (thrust-free forecast).
         this.drawTrajectoryGhost();
         
-        // Update gravity object glows
+        // Update gravity-object visual effects each frame: move each star's
+        // sprite with its body, then redraw the additive-blend corona with
+        // three layers of jitter'd prominences, a shimmering Einstein-ring
+        // annulus at ~1.6R, and six radial flame tongues.
+        const tNow = this.time.now * 0.001;
         this.gravityObjects.forEach(obj => {
-            const glow = obj.getData('glow');
-            if (glow) {
-                glow.x = obj.x;
-                glow.y = obj.y;
+            const sprite = obj.getData('sprite');
+            if (sprite) {
+                sprite.x = obj.x;
+                sprite.y = obj.y;
+            }
+            // Black holes take a different overlay: a rotating asymmetric
+            // brightness arc on the accretion disk (Doppler-beaming hint),
+            // rather than the star corona / flame tongues.
+            if (obj.getData('isBlackHole')) {
+                const overlay = obj.getData('accretionOverlay');
+                if (!overlay) return;
+                overlay.clear();
+                overlay.setPosition(obj.x, obj.y);
+                const Rbh = obj.radius || 280;
+                const bhSeed = obj.getData('accretionSeed') || 0;
+                const spin = tNow * 0.8 + bhSeed;
+                // Draw a series of short bright arc segments along the disk,
+                // brightest on the "approaching" side of the rotation.
+                const segments = 24;
+                const rInner = Rbh * 1.05;
+                const rOuter = Rbh * 2.2;
+                for (let k = 0; k < segments; k++) {
+                    const a0 = (k / segments) * Math.PI * 2 + spin;
+                    // Beaming: cosine of angle relative to the +x tangent
+                    // yields a bright half and a dim half.
+                    const beam = 0.5 + 0.5 * Math.cos(a0);
+                    const alpha = 0.05 + 0.35 * Math.pow(beam, 3);
+                    const rMid = rInner + (rOuter - rInner) * (0.15 + 0.35 * beam);
+                    const x1 = Math.cos(a0) * rMid;
+                    // Squish vertically to match the inclined-disk texture.
+                    const y1 = Math.sin(a0) * rMid * 0.55;
+                    overlay.fillStyle(0xffcc66, alpha);
+                    overlay.fillCircle(x1, y1, Math.max(2, Rbh * 0.08));
+                }
+                // Thin bright shimmer on the photon sphere.
+                const phShim = 0.4 + 0.25 * Math.sin(tNow * 3.0 + bhSeed);
+                overlay.lineStyle(Math.max(1, Rbh * 0.02), 0xffffff, phShim);
+                overlay.strokeCircle(0, 0, Rbh * 1.02);
+                return;
+            }
+
+            const corona = obj.getData('corona');
+            if (!corona) return;
+            corona.clear();
+            corona.setPosition(obj.x, obj.y);
+            const R = obj.radius || 700;
+            const seed = obj.getData('coronaSeed') || 0;
+
+            // Three concentric prominence layers, additive.
+            for (let k = 0; k < 3; k++) {
+                const phase = tNow * (0.7 + k * 0.4) + seed;
+                const rr = R * (1.02 + 0.10 * (k + 1) / 3 + 0.02 * Math.sin(phase));
+                const a = 0.10 * (1 - k / 3) + 0.03 * Math.sin(phase * 1.3);
+                corona.fillStyle(0xff8833, Math.max(0.02, a));
+                corona.fillCircle(0, 0, rr);
+            }
+
+            // Bright thin Einstein-ring shimmer at ~1.6R.
+            const shimmer = 0.55 + 0.15 * Math.sin(tNow * 2.0 + seed);
+            corona.lineStyle(Math.max(1, R * 0.03), 0xffe0a0, shimmer);
+            corona.strokeCircle(0, 0, R * 1.6);
+
+            // Six radial flame tongues extending from the limb.
+            for (let k = 0; k < 6; k++) {
+                const ang = (k / 6) * Math.PI * 2 + tNow * 0.15 + seed;
+                const cosA = Math.cos(ang);
+                const sinA = Math.sin(ang);
+                const x1 = cosA * R * 1.02;
+                const y1 = sinA * R * 1.02;
+                const flameLen = R * (0.20 + 0.15 * Math.sin(tNow * 1.5 + seed + k));
+                const x2 = cosA * (R * 1.02 + flameLen);
+                const y2 = sinA * (R * 1.02 + flameLen);
+                corona.lineStyle(
+                    Math.max(2, R * 0.05),
+                    0xffaa44,
+                    0.35 + 0.15 * Math.sin(tNow * 2 + seed + k)
+                );
+                corona.beginPath();
+                corona.moveTo(x1, y1);
+                corona.lineTo(x2, y2);
+                corona.strokePath();
             }
         });
         
@@ -3493,11 +4135,41 @@ class GameScene extends Phaser.Scene {
     }
 
     drawBackground() {
+        // Static single-pass render: called once from createBackground and
+        // never again. Nebula clouds are painted first (behind), then the
+        // colored bg stars, then diffraction spikes on the brightest ones.
+        // No twinkle and no dynamic gravitational-lensing displacement, so
+        // the starfield contributes zero per-frame render cost.
         this.bg.clear();
-        this.bgStars.forEach(star => {
-            this.bg.fillStyle(0xffffff, star.alpha);
+
+        // Nebula clouds (behind stars). Three concentric alpha-stacked layers
+        // give a smooth radial falloff.
+        for (const n of this.bgNebulas) {
+            for (let ring = 3; ring >= 1; ring--) {
+                const rr = n.r * (ring / 3);
+                const a = n.alpha * (ring === 1 ? 1.5 : (ring === 2 ? 0.8 : 0.35));
+                const c = (ring === 1) ? n.colorInner : n.colorOuter;
+                this.bg.fillStyle(c, a);
+                this.bg.fillCircle(n.x, n.y, rr);
+            }
+        }
+
+        // Bg stars with optional diffraction spikes.
+        for (const star of this.bgStars) {
+            this.bg.fillStyle(star.color, star.alpha);
             this.bg.fillCircle(star.x, star.y, star.size);
-        });
+
+            if (star.bright) {
+                const spikeLen = star.size * 5;
+                this.bg.lineStyle(1, star.color, star.alpha * 0.35);
+                this.bg.beginPath();
+                this.bg.moveTo(star.x - spikeLen, star.y);
+                this.bg.lineTo(star.x + spikeLen, star.y);
+                this.bg.moveTo(star.x, star.y - spikeLen);
+                this.bg.lineTo(star.x, star.y + spikeLen);
+                this.bg.strokePath();
+            }
+        }
     }
 
     handleInput(delta) {
@@ -3645,7 +4317,8 @@ class GameScene extends Phaser.Scene {
         const velocityDilation = Math.sqrt(1 - beta2);
         
         const timeDilation = Math.max(0.05, gravitationalDilation * velocityDilation);
-        
+        this.currentDilation = timeDilation;
+
         this.shipTime += (delta / 1000) * timeDilation;
         this.earthTime += delta / 1000;
     }
@@ -3686,8 +4359,6 @@ class GameScene extends Phaser.Scene {
         const lines = [
             `Fuel: ${Math.max(0, this.fuel).toFixed(1)}`,
             `Ammo: ${this.ammo}`,
-            `Ship Time: ${this.shipTime.toFixed(1)}s`,
-            `Earth Time: ${this.earthTime.toFixed(1)}s`,
             `Distance: ${distToEarth.toFixed(0)}`,
             `v_r: ${radialV.toFixed(2)}`,
             `v_tan: ${tangentialV.toFixed(2)}`,
@@ -3709,6 +4380,9 @@ class GameScene extends Phaser.Scene {
 
         this.statsText.setText(lines);
 
+        // Dual-clock time-dilation widget (below statsText).
+        this.updateTimeDilationHUD();
+
         // Clear HUD graphics before drawing overlays
         if (this.radar) {
             this.radar.clear();
@@ -3723,6 +4397,85 @@ class GameScene extends Phaser.Scene {
         this.drawRadar();
     }
     
+    updateTimeDilationHUD() {
+        // Layout: 380x160 panel below the top-left statsText. The panel is
+        // split vertically into two clock columns (ship left, Earth right)
+        // with a dilation-factor + gap readout below.
+        const px = 10;
+        const py = 260;
+        const pw = 380;
+        const ph = 108;
+
+        const dil = this.currentDilation || 1.0;
+        // Gamma: how much faster the Earth clock runs vs. the ship clock.
+        const gamma = 1 / Math.max(0.05, dil);
+        const gapSec = this.earthTime - this.shipTime;
+        const shipYrs = this.shipTime * TIME_NARRATIVE_YEARS_PER_SECOND;
+        const earthYrs = this.earthTime * TIME_NARRATIVE_YEARS_PER_SECOND;
+        const gapYrs = gapSec * TIME_NARRATIVE_YEARS_PER_SECOND;
+
+        // Color-code the panel border and dilation-factor text by severity.
+        let borderColor = 0x66aa66;
+        let dilFill = '#aaffaa';
+        if (gamma >= 3) {
+            borderColor = 0xff4444;
+            dilFill = '#ff6666';
+        } else if (gamma >= 1.5) {
+            borderColor = 0xffaa44;
+            dilFill = '#ffbb66';
+        } else if (gamma >= 1.1) {
+            borderColor = 0xffff44;
+            dilFill = '#ffff88';
+        }
+
+        const g = this.timeDilationPanel;
+        g.clear();
+        g.fillStyle(0x000000, 0.75);
+        g.fillRect(px, py, pw, ph);
+        g.lineStyle(2, borderColor, 0.9);
+        g.strokeRect(px, py, pw, ph);
+        // Vertical divider between the two clock columns.
+        g.lineStyle(1, 0x666666, 0.5);
+        g.beginPath();
+        g.moveTo(px + pw / 2, py + 8);
+        g.lineTo(px + pw / 2, py + 52);
+        g.strokePath();
+
+        const fmtTime = (t) => {
+            if (t < 60) return `${t.toFixed(1)}s`;
+            const m = Math.floor(t / 60);
+            const s = t - m * 60;
+            return `${m}m ${s.toFixed(1)}s`;
+        };
+        const fmtYears = (y) => {
+            if (y < 1) return `${(y * 12).toFixed(1)} months`;
+            if (y < 100) return `${y.toFixed(1)} years`;
+            return `${Math.round(y).toLocaleString()} years`;
+        };
+
+        const leftCx = px + pw * 0.25;
+        const rightCx = px + pw * 0.75;
+        this.shipClockLabel.setPosition(leftCx, py + 8);
+        this.shipClockText.setPosition(leftCx, py + 24).setText(fmtTime(this.shipTime));
+        this.earthClockLabel.setPosition(rightCx, py + 8);
+        this.earthClockText.setPosition(rightCx, py + 24).setText(fmtTime(this.earthTime));
+
+        this.dilationText
+            .setPosition(px + pw / 2, py + 60)
+            .setText(`γ = ${gamma.toFixed(2)}×   ship / earth clock rate = ${dil.toFixed(3)}`)
+            .setFill(dilFill);
+
+        let gapStr;
+        if (gapSec < 1) {
+            gapStr = 'Clocks are essentially synchronized';
+        } else if (gapSec < 60) {
+            gapStr = `Earth is ${gapSec.toFixed(1)}s (${fmtYears(gapYrs)}) ahead of you`;
+        } else {
+            gapStr = `Earth is ${(gapSec / 60).toFixed(1)}m (${fmtYears(gapYrs)}) ahead of you`;
+        }
+        this.timeGapText.setPosition(px + pw / 2, py + 84).setText(gapStr);
+    }
+
     drawAutopilotControls() {
         try {
             // Use cached control state from last update
@@ -4040,8 +4793,8 @@ class GameScene extends Phaser.Scene {
         const messageLines = [
             `EARTH REACHED!`,
             '',
-            `Earth Time: ${this.earthTime.toFixed(1)}s`,
-            `Ship Time: ${this.shipTime.toFixed(1)}s`,
+            `You experienced: ${this.shipTime.toFixed(1)}s`,
+            `Earth experienced: ${this.earthTime.toFixed(1)}s`,
             `Time Lost: ${timeLost.toFixed(1)}s`
         ];
         if (bestLine) {

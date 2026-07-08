@@ -1,6 +1,6 @@
 # Space Race — Relativistic Journey
 
-> **Note:** Created with AI assistance and iterative prompting, obviously, via the Cascade / Windsurf agent, including this README.
+> **Note:** This project was generated with AI assistance (via the Cascade / Windsurf agent). Every line of code, every design decision, and this README itself was produced through iterative prompting rather than written from scratch by a human. Treat it as a demo of AI-driven game development, not a hand-crafted production codebase.
 
 ## What it is
 
@@ -33,15 +33,12 @@ The file loads Phaser 3.60 from the jsDelivr CDN, so an internet connection is r
 
 ## Star system
 
-Each run generates six massive gravitating objects and pins their initial conditions:
+Each run generates eight identical massive stars, all sharing the same radius, mass, and gravitational parameter. Their t=0 positions and velocities are sampled with essentially no structure — the only constraints are physical safety:
 
-- **Primary "target" star.** Sampled so that its Gaussian-distributed target position lands at roughly 40% along the S-E baseline when the rocket reaches that same fraction of the trip. Its t=0 position is back-propagated as `r_s(0) = r_target − v · t_h`.
-- **Secondary star.** Placed at ~80% along the S-E baseline with a 2D Gaussian offset (sd = 3 star radii) on a randomly chosen side.
-- **Four background stars.** Rejection-sampled across the world subject to: (a) at least 8 star radii from the S-E baseline, (b) at least 8 star radii from any other star, (c) at least 6 star radii of clearance from the primary's straight-line path.
+- **Position** — uniform random over the whole world, rejection-sampled subject to (a) at least 10 star radii from Earth, (b) at least 5 star radii from the ship's spawn, (c) at least 4 star radii from any other star (numerical-stability floor for the N-body integrator).
+- **Velocity** — isotropic direction over `[0, 2π)`, Gaussian speed (mean 200, sd 50, clamped positive), further rejection-sampled so the star's straight-line trajectory stays at least 10 star radii from Earth over the full gameplay horizon.
 
-Every star gets an **isotropic random velocity** — uniform direction over `[0, 2π)`, Gaussian speed (mean 200, sd 50, clamped positive). An additional **Earth-clearance rejection filter** requires each star's straight-line trajectory to stay at least 10 star radii from Earth over the gameplay horizon, so Earth-star gravitational coupling can be safely neglected.
-
-The stars then interact with each other under full pairwise Newtonian gravity (symplectic Euler, both in the pre-flight trajectory sweep and in live gameplay).
+That Earth-clearance filter (on both position and velocity) is what lets us safely neglect Earth-star gravitational coupling. The stars themselves then interact under full pairwise Newtonian gravity (symplectic Euler, both in the pre-flight trajectory sweep and in live gameplay).
 
 ## Notable mechanics
 
