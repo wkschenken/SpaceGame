@@ -1456,6 +1456,16 @@ class GameScene extends Phaser.Scene {
                 this.physics.add.overlap(this.player, bh, this.loseGame, null, this);
             }
         }
+        // Stars are lethal too: if the ship's center passes within a star's
+        // photosphere it's a hard collision. Iterate gravityObjects and skip
+        // any entry already registered above as a black hole.
+        if (this.gravityObjects && this.gravityObjects.length) {
+            const bhSet = new Set(this.blackHoles || []);
+            for (const star of this.gravityObjects) {
+                if (bhSet.has(star)) continue;
+                this.physics.add.overlap(this.player, star, this.loseGame, null, this);
+            }
+        }
         this.physics.add.overlap(this.player, this.fuelPickups, this.collectFuel, null, this);
         this.physics.add.overlap(this.player, this.ammoPickups, this.collectAmmo, null, this);
         
@@ -4499,8 +4509,17 @@ class GameScene extends Phaser.Scene {
         const timeDilation = Math.max(0.05, gravitationalDilation * velocityDilation);
         this.currentDilation = timeDilation;
 
-        this.shipTime += (delta / 1000) * timeDilation;
-        this.earthTime += delta / 1000;
+        // Frame convention: ship-frame is the "wall clock" here -- shipTime
+        // ticks at exactly the game delta, matching what an observer aboard
+        // the ship would read on their watch. Earth-frame elapsed time then
+        // runs FASTER by 1/timeDilation (= Lorentz gamma including
+        // gravitational potential), which is the Earth-frame duration that
+        // corresponds to the ship's proper-time interval. This preserves
+        // the physics ratio earthTime/shipTime == gamma; only the choice of
+        // "which frame is real time" has flipped.
+        const dtShip = delta / 1000;
+        this.shipTime += dtShip;
+        this.earthTime += dtShip / timeDilation;
 
         // Earth-time deadline (only when the global toggle is on and the
         // game isn't already over). Arm the countdown the first time the
@@ -4513,7 +4532,7 @@ class GameScene extends Phaser.Scene {
                     this.earthTimeAfterArm = 0;
                 }
             } else {
-                this.earthTimeAfterArm += delta / 1000;
+                this.earthTimeAfterArm += dtShip / timeDilation;
                 if (this.earthTimeAfterArm > this.earthDeadline) {
                     this.earthDeadlineFired = true;
                     this.loseGame('DEADLINE');
