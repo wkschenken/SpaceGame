@@ -35,16 +35,15 @@
     // when rendering "years elapsed" labels.
     const TIME_NARRATIVE_YEARS_PER_SECOND = 1.0;
 
+    // Ensemble test: N fully-random autopilot runs, each identical to
+    // manually clicking Autopilot and hitting "New Seed". Per-run outcomes
+    // (success, times, fuel usage, failure mode) are accumulated in
+    // `results` and summarized at the end.
     const experimentConfig = {
-        enabled: false,           // only enabled when "Test" mode is selected
-        radius: 3000,             // radial distance from start to Earth
-        // 0, 40, 80, ..., 320 (9 angles total)
-        anglesDeg: Array.from({ length: 9 }, (_, i) => i * 40),
-        trialsPerAngle: 4,
-        successes: new Array(9).fill(0),
-        attempts: new Array(9).fill(0),
-        angleIndex: 0,
-        trialIndex: 0,
+        enabled: false,           // true while an ensemble test is in progress
+        totalRuns: 20,
+        runIndex: 0,              // index of the run currently in progress
+        results: [],              // one entry per completed run
         finished: false
     };
 
@@ -1356,13 +1355,17 @@ class GameScene extends Phaser.Scene {
         // Create background stars
         this.createBackground();
         
-        // Initialize start and destination positions.
+        // Initialize start and destination positions. TEST mode uses the
+        // same random initializer as Autopilot so every trial is a truly
+        // fresh world (no baseline-rotation sweep any more).
         if (experimentConfig.enabled) {
             this.mode = 'TEST';
-            this.initializeExperimentStartAndDestination();
-        } else {
-            this.initializeStartAndDestination();
+            // Never reuse the prior world snapshot inside an ensemble run;
+            // each trial must be a fresh seed.
+            this.replayRequested = false;
+            this.worldSnapshot = null;
         }
+        this.initializeStartAndDestination();
         this.createPlayer();
         this.createEarth();
 
@@ -1830,70 +1833,6 @@ class GameScene extends Phaser.Scene {
         };
     }
 
-    initializeExperimentStartAndDestination() {
-        // Use the same S->E distance range and world geometry as normal
-        // Autopilot mode, but constrain the *direction* of the S->E vector
-        // to the current experiment angle. This makes TEST runs comparable
-        // to real Autopilot runs while still sweeping approach angles.
-
-        // First, generate a reasonable start/Earth pair using the normal
-        // initializer (random position, distance in [0.8, 1.2] * worldSize,
-        // and within margins).
-        this.initializeStartAndDestination();
-
-        const baseSx = this.startX;
-        const baseSy = this.startY;
-        const baseEx = this.earthX;
-        const baseEy = this.earthY;
-
-        const dx = baseEx - baseSx;
-        const dy = baseEy - baseSy;
-        const len = Math.sqrt(dx * dx + dy * dy) || 1;
-
-        // Preserve the original S->E distance but rotate its direction to
-        // match the current experiment angle, while ensuring that both the
-        // start and Earth positions remain inside the world margins.
-        const angleDeg = experimentConfig.anglesDeg[experimentConfig.angleIndex];
-        const angleRad = Phaser.Math.DegToRad(angleDeg);
-        const ux = Math.cos(angleRad);
-        const uy = Math.sin(angleRad);
-
-        const worldSize = this.worldSize;
-        const marginStart = 200;
-        const marginEarth = 200;
-        const maxAttempts = 200;
-
-        let placed = false;
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const candidateStartX = Phaser.Math.Between(marginStart, worldSize - marginStart);
-            const candidateStartY = Phaser.Math.Between(marginStart, worldSize - marginStart);
-            const candidateEarthX = candidateStartX + ux * len;
-            const candidateEarthY = candidateStartY + uy * len;
-
-            if (
-                candidateEarthX > marginEarth && candidateEarthX < worldSize - marginEarth &&
-                candidateEarthY > marginEarth && candidateEarthY < worldSize - marginEarth
-            ) {
-                this.startX = candidateStartX;
-                this.startY = candidateStartY;
-                this.earthX = candidateEarthX;
-                this.earthY = candidateEarthY;
-                placed = true;
-                break;
-            }
-        }
-
-        if (!placed) {
-            // If we cannot find a placement that fits the requested angle and
-            // distance within the world, fall back to the original Autopilot
-            // geometry for this trial.
-            this.startX = baseSx;
-            this.startY = baseSy;
-            this.earthX = baseEx;
-            this.earthY = baseEy;
-        }
-    }
-
     createPlayer() {
         // Start player near left side of world
         const startX = this.startX;
@@ -2038,11 +1977,23 @@ class GameScene extends Phaser.Scene {
             return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
         };
 
-        // Isotropic direction, Gaussian(mean=200, sd=50) speed clamped positive.
+        // Common bulk drift perpendicular to the S->E baseline (90 deg CCW),
+        // magnitude 200 world-units/s. On top of this every star also gets an
+        // isotropic random kick with Gaussian(mean=100, sd=50) speed. Net
+        // effect: the ensemble sweeps across the trajectory corridor while
+        // still having internal diffusive motion.
+        const perpDriftMag = 200;
+        const perpX = -dySE / lenSE;
+        const perpY =  dxSE / lenSE;
+        const driftVx = perpX * perpDriftMag;
+        const driftVy = perpY * perpDriftMag;
         const sampleVelocity = () => {
             const a = Math.random() * Math.PI * 2;
-            const speed = Math.max(1, 200 + sampleGaussian() * 50);
-            return { vx: Math.cos(a) * speed, vy: Math.sin(a) * speed };
+            const speed = Math.max(1, 100 + sampleGaussian() * 50);
+            return {
+                vx: driftVx + Math.cos(a) * speed,
+                vy: driftVy + Math.sin(a) * speed
+            };
         };
 
         // Closed-form min distance from Earth to the straight-line ray
@@ -3648,6 +3599,48 @@ class GameScene extends Phaser.Scene {
         // Earth-time budget readout, populated only when the deadline toggle
         // is on. Sits below the dilationText.
         this.earthBudgetText = mkText(13, '#88bbff', true);
+
+        // Running TEST-progress readout (top-right). Only populated when an
+        // ensemble test is active. Left-aligned monospaced text so mean/sd
+        // columns line up. Cumulative stats are computed from
+        // experimentConfig.results, which persists across scene restarts.
+        if (experimentConfig.enabled) {
+            const camW = this.cameras.main.width;
+            const s = this._computeExperimentStats();
+            const pct = (x) => (x * 100).toFixed(1);
+            const fmt = (x) => x.toFixed(2);
+            const line = (label, st) => (st.n > 0)
+                ? `${label}${fmt(st.mean).padStart(6)} \u00b1 ${fmt(st.sd).padStart(5)}`
+                : `${label}    -   \u00b1   -  `;
+            const totalRuns = experimentConfig.totalRuns;
+            const currentRun = Math.min(experimentConfig.runIndex + 1, totalRuns);
+            const doneRuns = s.totalCompleted;
+            const lines = [];
+            lines.push(`ENSEMBLE TEST  run ${currentRun}/${totalRuns}`);
+            lines.push(`Successes: ${s.successCount}/${doneRuns}` +
+                (doneRuns > 0 ? `  (${pct(s.successRate)}%)` : ''));
+            if (s.failureCount > 0) {
+                const parts = [];
+                if (s.collisions > 0) parts.push(`${s.collisions} coll`);
+                if (s.deadlines  > 0) parts.push(`${s.deadlines} dead`);
+                lines.push(`Failures:  ${s.failureCount}  (${parts.join(', ')})`);
+            }
+            lines.push('');
+            lines.push('Successful runs (mean \u00b1 sd):');
+            lines.push(line('  Earth t (s): ', s.earthTime));
+            lines.push(line('  Ship  t (s): ', s.shipTime));
+            lines.push(line('  Lost  t (s): ', s.lostTime));
+            lines.push(line('  Fuel used  : ', s.fuelUsed));
+            this.testProgressText = this.add.text(camW - 10, 10, lines.join('\n'), {
+                fontSize: '14px',
+                fill: '#ffdd66',
+                backgroundColor: '#000a',
+                padding: { x: 10, y: 6 },
+                fontFamily: 'monospace',
+                align: 'left'
+            }).setOrigin(1, 0).setScrollFactor(0).setDepth(1001);
+        }
+
         
         // Instructions
         this.add.text(
@@ -3781,7 +3774,7 @@ class GameScene extends Phaser.Scene {
 
         const makeButton = (label, index, handler) => {
             const y = buttonStartY + index * buttonSpacing;
-            const btnBg = this.add.rectangle(centerX, y, 300, 42, 0x003344, 0.9)
+            const btnBg = this.add.rectangle(centerX, y, 460, 42, 0x003344, 0.9)
                 .setScrollFactor(0)
                 .setDepth(3001)
                 .setStrokeStyle(1, 0x00ffff, 0.5)
@@ -3809,13 +3802,11 @@ class GameScene extends Phaser.Scene {
             this.scene.restart();
         });
 
-        makeButton('Test (90-run experiment)', 2, () => {
+        makeButton(`Ensemble test (${experimentConfig.totalRuns} autopilot runs)`, 2, () => {
             globalMode = 'TEST';
             experimentConfig.enabled = true;
-            experimentConfig.successes.fill(0);
-            experimentConfig.attempts.fill(0);
-            experimentConfig.angleIndex = 0;
-            experimentConfig.trialIndex = 0;
+            experimentConfig.runIndex = 0;
+            experimentConfig.results.length = 0;
             experimentConfig.finished = false;
             elements.forEach(e => e.destroy());
             this.scene.restart();
@@ -4882,8 +4873,14 @@ class GameScene extends Phaser.Scene {
 
         // Record experiment failure if enabled
         if (experimentConfig.enabled && !experimentConfig.finished) {
-            const idx = experimentConfig.angleIndex;
-            experimentConfig.attempts[idx]++;
+            experimentConfig.results.push({
+                success: false,
+                reason: this.lastLoseReason || 'COLLISION',
+                earthTime: this.earthTime || 0,
+                shipTime: this.shipTime || 0,
+                lostTime: (this.earthTime || 0) - (this.shipTime || 0),
+                fuelUsed: 100 - (this.fuel || 0)
+            });
             // Show a quick failure indicator for TEST runs
             const cam = this.cameras.main;
             const failText = this.add.text(cam.width / 2, cam.height / 2, '✗', {
@@ -4947,9 +4944,14 @@ class GameScene extends Phaser.Scene {
 
         // Record experiment success if enabled
         if (experimentConfig.enabled && !experimentConfig.finished) {
-            const idx = experimentConfig.angleIndex;
-            experimentConfig.attempts[idx]++;
-            experimentConfig.successes[idx]++;
+            experimentConfig.results.push({
+                success: true,
+                reason: null,
+                earthTime: this.earthTime || 0,
+                shipTime: this.shipTime || 0,
+                lostTime: (this.earthTime || 0) - (this.shipTime || 0),
+                fuelUsed: 100 - (this.fuel || 0)
+            });
             // Show a quick success indicator for TEST runs
             const cam = this.cameras.main;
             const successText = this.add.text(cam.width / 2, cam.height / 2, '✓', {
@@ -5081,64 +5083,89 @@ class GameScene extends Phaser.Scene {
     }
 
     advanceExperimentTrial() {
-        const angles = experimentConfig.anglesDeg;
-        const trialsPerAngle = experimentConfig.trialsPerAngle;
-
-        experimentConfig.trialIndex++;
-        if (experimentConfig.trialIndex >= trialsPerAngle) {
-            experimentConfig.trialIndex = 0;
-            experimentConfig.angleIndex++;
-        }
-
-        if (experimentConfig.angleIndex >= angles.length) {
+        experimentConfig.runIndex++;
+        if (experimentConfig.runIndex >= experimentConfig.totalRuns) {
             experimentConfig.finished = true;
             this.showExperimentResults();
             return;
         }
-
         this.scene.restart();
     }
 
+    _computeExperimentStats() {
+        // Compute mean and (sample) standard deviation of `values`.
+        const stats = (values) => {
+            const n = values.length;
+            if (n === 0) return { n: 0, mean: 0, sd: 0 };
+            let sum = 0;
+            for (const v of values) sum += v;
+            const mean = sum / n;
+            if (n < 2) return { n, mean, sd: 0 };
+            let sq = 0;
+            for (const v of values) sq += (v - mean) * (v - mean);
+            const sd = Math.sqrt(sq / (n - 1));
+            return { n, mean, sd };
+        };
+        const results = experimentConfig.results;
+        const successes = results.filter(r => r.success);
+        const failures = results.filter(r => !r.success);
+        const collisions = failures.filter(r => r.reason === 'COLLISION').length;
+        const deadlines = failures.filter(r => r.reason === 'DEADLINE').length;
+        return {
+            totalCompleted: results.length,
+            successCount: successes.length,
+            failureCount: failures.length,
+            collisions,
+            deadlines,
+            successRate: results.length ? successes.length / results.length : 0,
+            earthTime: stats(successes.map(r => r.earthTime)),
+            shipTime: stats(successes.map(r => r.shipTime)),
+            lostTime: stats(successes.map(r => r.lostTime)),
+            fuelUsed: stats(successes.map(r => r.fuelUsed))
+        };
+    }
+
     showExperimentResults() {
-        const lines = ['Experiment results (success rate vs angle):'];
-        for (let i = 0; i < experimentConfig.anglesDeg.length; i++) {
-            const angle = experimentConfig.anglesDeg[i];
-            const attempts = experimentConfig.attempts[i];
-            const successes = experimentConfig.successes[i];
-            const rate = attempts > 0 ? (successes / attempts) : 0;
-            lines.push(
-                `${angle.toFixed(0)}°: ${successes}/${attempts} ` +
-                `(${(rate * 100).toFixed(0)}%)`
-            );
-        }
+        const s = this._computeExperimentStats();
+        const fmt = (x) => x.toFixed(2);
+        const pct = (x) => (x * 100).toFixed(1);
+        const line = (label, st) => (st.n > 0)
+            ? `${label}  ${fmt(st.mean)} ± ${fmt(st.sd)}  (n=${st.n})`
+            : `${label}  (no successful runs)`;
 
-        // Overall success statistics
-        let totalAttempts = 0;
-        let totalSuccesses = 0;
-        for (let i = 0; i < experimentConfig.anglesDeg.length; i++) {
-            totalAttempts += experimentConfig.attempts[i];
-            totalSuccesses += experimentConfig.successes[i];
-        }
-        const overallRate = totalAttempts > 0 ? (totalSuccesses / totalAttempts) : 0;
-        const overallPercent = (overallRate * 100).toFixed(1);
-
+        const lines = [];
+        lines.push(`Ensemble test results: ${experimentConfig.totalRuns} runs`);
         lines.push('');
-        lines.push(`Overall: ${totalSuccesses}/${totalAttempts} (${overallPercent}%)`);
+        lines.push(`Successes:  ${s.successCount}/${s.totalCompleted}  (${pct(s.successRate)}%)`);
+        if (s.failureCount > 0) {
+            const parts = [];
+            if (s.collisions > 0) parts.push(`${s.collisions} collision`);
+            if (s.deadlines  > 0) parts.push(`${s.deadlines} deadline`);
+            lines.push(`Failures:   ${s.failureCount}  (${parts.join(', ')})`);
+        }
+        lines.push('');
+        lines.push('Successful-run statistics (mean ± sd):');
+        lines.push(line('  Earth flight time (s): ', s.earthTime));
+        lines.push(line('  Ship  flight time (s): ', s.shipTime));
+        lines.push(line('  Time lost to dilation: ', s.lostTime));
+        lines.push(line('  Fuel used (of 100):    ', s.fuelUsed));
+
         if (lastAdoptedSuccessRate !== null) {
-            const lastPercent = (lastAdoptedSuccessRate * 100).toFixed(1);
-            lines.push(`Previous adopted success: ${lastPercent}%`);
-        } else {
-            lines.push('Previous adopted success: (none)');
+            lines.push('');
+            lines.push(`Previous adopted success rate: ${pct(lastAdoptedSuccessRate)}%`);
         }
         lines.push('');
-        lines.push('Adopt new parameters for Autopilot/Manual?');
+        lines.push('Adopt current tuning as the new Autopilot/Manual defaults?');
+
+        const overallRate = s.successRate;
 
         const text = this.add.text(600, 300, lines.join('\n'), {
             fontSize: '18px',
             fill: '#0f0',
             align: 'left',
             backgroundColor: '#000c',
-            padding: { x: 20, y: 10 }
+            padding: { x: 20, y: 10 },
+            fontFamily: 'monospace'
         }).setOrigin(0.5).setScrollFactor(0).setDepth(2000);
 
         const makeButton = (label, offsetX, handler) => {

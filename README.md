@@ -4,7 +4,7 @@
 
 ## What it is
 
-A single-file 2D space game where the player (or an autopilot) flies a ship from a random starting point to Earth across a large 2D world, threading through a small cluster of massive stars (and optionally black holes) that pull on the ship and on each other. Special and general relativity are simulated end-to-end: the ship's onboard clock runs slower than Earth's when moving fast or deep in a gravity well, and the visible starfield is Doppler-shifted, relativistically aberrated, and intensity-beamed by the ship's velocity.
+A single-file 2D space game where the player (or an autopilot) flies a ship from a random starting point to Earth across a large 2D world. Depending on which world-options you enable, the trip may thread through a small cluster of gravitationally-interacting massive stars, dodge drifting asteroids, and negotiate a black hole. Special and general relativity are simulated end-to-end: the ship's onboard clock runs slower than Earth's when moving fast or deep in a gravity well, and the visible starfield is Doppler-shifted, relativistically aberrated, and intensity-beamed by the ship's velocity.
 
 ## How to run
 
@@ -13,16 +13,27 @@ A single-file 2D space game where the player (or an autopilot) flies a ship from
 
 The file loads Phaser 3.60 from the jsDelivr CDN, so an internet connection is required the first time you open it (browser caching handles subsequent loads).
 
-## Modes
+## Menu
 
+The mode-select screen has two sections:
+
+**World options** (four checkboxes, off by default):
+- **Massive objects (suns, black holes)** — spawn the star cluster (and, if enabled, one black hole). Without this the world is empty and every trip is a straight line.
+- **Asteroids** — spawn drifting asteroids that can collide with the ship.
+- **Tokens (fuel & ammo pickups)** — scatter collectible pickups.
+- **Earth-time deadline (hard loss if exceeded)** — enforce a time budget on the trip (see Notable mechanics below).
+
+**Modes**:
 - **MANUAL** — fly the ship yourself with the keyboard.
 - **AUTOPILOT** — the autopilot plans a slingshot trajectory (numerical sweep of departure angles under simulated gravity) and flies the ship to Earth automatically.
-- **TEST** — batch experiment that runs many autopilot trials at a sweep of approach angles and reports success rates. Used for tuning the autopilot.
+- **Ensemble test (20 autopilot runs)** — runs 20 fully-random autopilot trials back-to-back (each equivalent to clicking Autopilot with a new seed) and reports success rate, plus mean±sd of Earth-frame flight time, ship-frame flight time, time lost to relativistic dilation, and fuel used. A live top-right HUD tracks the running totals as trials complete. At the end, an **Adopt / Keep** dialog offers to persist the currently-active tuning parameters as the new defaults (or discard them).
+- **Tuning (adjust parameters)** — opens a sliders panel for the autopilot's PID gains, cruise speed, Isp, deadline multiplier, etc. Values persist across page loads via `localStorage`.
 
 ## Controls (MANUAL mode)
 
-- **Arrow keys** — rotate / thrust
-- **Space** — fire (if the mode / build includes weapons)
+- **Left / Right arrows** — rotate the ship
+- **Up arrow** — main thruster
+- **Space** — fire (if ammo > 0 and asteroids are enabled)
 - **R** — restart current run after landing or crashing
 
 ## HUD & overlays
@@ -38,7 +49,7 @@ The file loads Phaser 3.60 from the jsDelivr CDN, so an internet connection is r
 Each run generates eight identical massive stars, all sharing the same radius, mass, and gravitational parameter. Their t=0 positions and velocities are sampled with essentially no structure — the only constraints are physical safety:
 
 - **Position** — uniform random over the whole world, rejection-sampled subject to (a) at least 10 star radii from Earth, (b) at least 5 star radii from the ship's spawn, (c) at least 4 star radii from any other star (numerical-stability floor for the N-body integrator).
-- **Velocity** — isotropic direction over `[0, 2π)`, Gaussian speed (mean 200, sd 50, clamped positive), further rejection-sampled so the star's straight-line trajectory stays at least 10 star radii from Earth over the full gameplay horizon.
+- **Velocity** — a common bulk drift of 200 world-units/s perpendicular to the S→E baseline (90° CCW), plus a per-star isotropic random kick with Gaussian(mean=100, sd=50) speed. The result is further rejection-sampled so the star's straight-line trajectory stays at least 10 star radii from Earth over the full gameplay horizon. The bulk drift sweeps the whole ensemble across the trajectory corridor while the random component preserves internal diffusive motion.
 
 That Earth-clearance filter (on both position and velocity) is what lets us safely neglect Earth-star gravitational coupling. The stars themselves then interact under full pairwise Newtonian gravity (symplectic Euler, both in the pre-flight trajectory sweep and in live gameplay).
 
