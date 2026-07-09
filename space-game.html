@@ -63,7 +63,13 @@
         kpLateral: 0.7,
         kiLateral: 0.13,
         kdLateral: 0.44,
-        maxLateralAccel: 100,
+        // Lateral (side-thruster) thrust as a fraction of main-engine thrust.
+        // The effective lateral acceleration cap is therefore
+        //     a_lat_max = lateralThrustRatio * currentMainThrustAccel(scene)
+        // which grows as fuel is spent, staying self-consistent with the
+        // rocket-equation main-thrust model. Default 0.67 reproduces the
+        // previous full-tank cap of 100 units/s^2 (0.67 * 150).
+        lateralThrustRatio: 0.67,
         Isp: 250,
         // Earth-time deadline multiplier: deadline = mult * (distSE / vCruise).
         // 1.5 gives ~50% slack over the ballistic-minimum trip time. Only used
@@ -135,7 +141,14 @@
             kpLateral: src.kpLateral,
             kiLateral: src.kiLateral,
             kdLateral: src.kdLateral,
-            maxLateralAccel: src.maxLateralAccel,
+            lateralThrustRatio: (typeof src.lateralThrustRatio === 'number'
+                ? src.lateralThrustRatio
+                // Legacy migration: earlier saves stored an absolute
+                // maxLateralAccel; convert to a ratio using the reference
+                // full-tank main accel of 150.
+                : (typeof src.maxLateralAccel === 'number'
+                    ? src.maxLateralAccel / 150
+                    : 0.67)),
             Isp: (typeof src.Isp === 'number' ? src.Isp : 300),
             earthDeadlineMult: (typeof src.earthDeadlineMult === 'number' ? src.earthDeadlineMult : 1.5)
         };
@@ -210,7 +223,7 @@
         { key: 'kpLateral',     label: 'Lateral kp',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
         { key: 'kiLateral',     label: 'Lateral ki',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
         { key: 'kdLateral',     label: 'Lateral kd',                   step: 0.01, min: 0.0,  max: 1.0,  decimals: 3 },
-        { key: 'maxLateralAccel', label: 'Max lateral accel',          step: 10,   min: 0.0,  max: 500,  decimals: 0 },
+        { key: 'lateralThrustRatio', label: 'Lateral thrust / Main thrust', step: 0.05, min: 0.0,  max: 2.0,  decimals: 2 },
         { key: 'Isp',           label: 'Specific impulse Isp (s)',     step: 25,   min: 100,  max: 1000, decimals: 0 }
     ];
 
@@ -291,9 +304,16 @@ class AutopilotController {
         this.kpLateral = activeTuningParams.kpLateral;
         this.kiLateral = activeTuningParams.kiLateral;
         this.kdLateral = activeTuningParams.kdLateral;
-        this.maxLateralAccel = activeTuningParams.maxLateralAccel;
         this.lateralErrorInt = 0;
         this.lateralLookaheadTime = 2.0;
+    }
+
+    // Live lateral-thruster acceleration cap. Scales with the current
+    // main-engine acceleration so that as fuel is spent (mass drops and
+    // main-thrust accel grows), the lateral cap grows in the same ratio.
+    // This keeps lateral thrust consistent with the rocket-equation model.
+    getMaxLateralAccel() {
+        return activeTuningParams.lateralThrustRatio * currentMainThrustAccel(this.scene);
     }
 
     // Live main-engine acceleration magnitude under the rocket equation.
@@ -1021,7 +1041,7 @@ class AutopilotController {
             const py = ux;
             const vTanEarth = sensors.vx * px + sensors.vy * py;
             const aLatCmd = -this.kpLateral * vTanEarth;
-            return Phaser.Math.Clamp(aLatCmd, -this.maxLateralAccel, this.maxLateralAccel);
+            return Phaser.Math.Clamp(aLatCmd, -this.getMaxLateralAccel(), this.getMaxLateralAccel());
         }
 
         const plan = this.scene.slingshotPlan;
@@ -1063,7 +1083,7 @@ class AutopilotController {
                 -this.kiLateral * this.lateralErrorInt +
                 -this.kdLateral * vLat;
 
-            let cmd = Phaser.Math.Clamp(aLatCmd, -this.maxLateralAccel, this.maxLateralAccel);
+            let cmd = Phaser.Math.Clamp(aLatCmd, -this.getMaxLateralAccel(), this.getMaxLateralAccel());
 
             const spd = Math.sqrt(sensors.vx * sensors.vx + sensors.vy * sensors.vy);
             if (spd > 1e-3) {
@@ -1084,7 +1104,7 @@ class AutopilotController {
         const perpY = Math.cos(sensors.theta);
         const vLat = sensors.vx * perpX + sensors.vy * perpY;
         const aLatCmd = -this.kpLateral * vLat;
-        return Phaser.Math.Clamp(aLatCmd, -this.maxLateralAccel, this.maxLateralAccel);
+        return Phaser.Math.Clamp(aLatCmd, -this.getMaxLateralAccel(), this.getMaxLateralAccel());
     }
     
     update(dt) {
@@ -1249,7 +1269,7 @@ class AutopilotController {
 
         // Apply lateral thrust (side boosters) without changing attitude.
         if (control.lateralThrust && this.scene.fuel > 0) {
-            const aLat = Phaser.Math.Clamp(control.lateralThrust, -this.maxLateralAccel, this.maxLateralAccel);
+            const aLat = Phaser.Math.Clamp(control.lateralThrust, -this.getMaxLateralAccel(), this.getMaxLateralAccel());
             const perpX = -Math.sin(this.scene.playerAngle);
             const perpY = Math.cos(this.scene.playerAngle);
             const dvx = perpX * aLat * dt;
@@ -2042,9 +2062,18 @@ class GameScene extends Phaser.Scene {
             for (let i = 0; i < numStars; i++) {
                 let placed = false;
                 for (let attempt = 0; attempt < maxAttempts; attempt++) {
-                    // Uniform position within the world.
-                    const cx = Math.random() * this.worldWidth;
-                    const cy = Math.random() * this.worldHeight;
+                    // Uniform position within a centered rectangle whose
+                    // *area* is 51.2% of the world (linear factor
+                    // 0.8 * sqrt(0.8) ~= 0.7155). This is two successive
+                    // 20% area-reductions from the full world (1.0 -> 0.64
+                    // via linear 0.8; then 0.64 -> 0.512 via linear
+                    // sqrt(0.8)). Keeps stars clustered closer to the play
+                    // corridor rather than the world edges.
+                    const spawnShrink = 0.8 * Math.sqrt(0.8);
+                    const spawnMarginX = 0.5 * (1 - spawnShrink) * this.worldWidth;
+                    const spawnMarginY = 0.5 * (1 - spawnShrink) * this.worldHeight;
+                    const cx = spawnMarginX + Math.random() * (this.worldWidth  * spawnShrink);
+                    const cy = spawnMarginY + Math.random() * (this.worldHeight * spawnShrink);
 
                     // Earth clearance: t=0 position must be outside the
                     // clearance disk.
@@ -3251,22 +3280,16 @@ class GameScene extends Phaser.Scene {
         const shipX = this.player ? this.player.x : null;
         const shipY = this.player ? this.player.y : null;
 
-        // Compute world-space bounds spanning start, Earth, and every star.
-        // (Ship is included too so the ship dot stays on-map even if the
-        // trajectory strays outside the S-Earth-stars bounding box.)
+        // Compute world-space bounds spanning ONLY the fixed geometry of
+        // this run: the start point, Earth, and (once planning finishes)
+        // the planned trajectory polyline. Deliberately excludes live stars
+        // and the ship so the map's domain never re-scales when a star
+        // drifts off-screen or the ship strays outside the plan envelope.
+        // Off-map stars / ship are simply clipped by the minimap panel.
         let minX = Math.min(Sx, Ex);
         let maxX = Math.max(Sx, Ex);
         let minY = Math.min(Sy, Ey);
         let maxY = Math.max(Sy, Ey);
-        for (const s of stars) {
-            minX = Math.min(minX, s.x); maxX = Math.max(maxX, s.x);
-            minY = Math.min(minY, s.y); maxY = Math.max(maxY, s.y);
-        }
-        if (shipX !== null) {
-            minX = Math.min(minX, shipX); maxX = Math.max(maxX, shipX);
-            minY = Math.min(minY, shipY); maxY = Math.max(maxY, shipY);
-        }
-        // Include the planned trajectory extents if a plan exists.
         const plan = this.slingshotPlan;
         const pts = plan && plan.trajectoryPoints;
         if (pts && pts.length > 0) {
@@ -3330,9 +3353,17 @@ class GameScene extends Phaser.Scene {
             g.strokePath();
         }
 
+        // Clip test: mapped point must lie inside the minimap panel to draw.
+        const inPanel = (p) => (
+            p.x >= mx && p.x <= mx + mw &&
+            p.y >= my && p.y <= my + mh
+        );
+
         // Stars (yellow filled circles, scaled physical radius clamped).
+        // Off-domain stars are simply omitted; the map keeps its fixed extent.
         for (const s of stars) {
             const sp = toMap(s.x, s.y);
+            if (!inPanel(sp)) continue;
             const sr = Math.max(3, Math.min(10, (s.radius || 0) * scale));
             g.fillStyle(0xffdd33, 1.0);
             g.fillCircle(sp.x, sp.y, sr);
@@ -3353,13 +3384,17 @@ class GameScene extends Phaser.Scene {
             g.fillRect(sp.x - 3, sp.y - 3, 6, 6);
         }
 
-        // Ship (white dot with black outline).
+        // Ship (white dot with black outline). Clipped to the minimap so a
+        // ship that wanders outside the fixed domain is simply hidden rather
+        // than drawn over the main game view.
         if (shipX !== null) {
             const shp = toMap(shipX, shipY);
-            g.fillStyle(0xffffff, 1.0);
-            g.fillCircle(shp.x, shp.y, 3);
-            g.lineStyle(1, 0x000000, 1.0);
-            g.strokeCircle(shp.x, shp.y, 3);
+            if (inPanel(shp)) {
+                g.fillStyle(0xffffff, 1.0);
+                g.fillCircle(shp.x, shp.y, 3);
+                g.lineStyle(1, 0x000000, 1.0);
+                g.strokeCircle(shp.x, shp.y, 3);
+            }
         }
     }
 
@@ -3802,9 +3837,24 @@ class GameScene extends Phaser.Scene {
             this.scene.restart();
         });
 
-        makeButton(`Ensemble test (${experimentConfig.totalRuns} autopilot runs)`, 2, () => {
+        makeButton('Ensemble test...', 2, () => {
+            // Pop up a native prompt for the run count. Defaults to the
+            // most recently used value (or 20 on first invocation). Cancel
+            // or invalid input aborts without starting a test.
+            const defaultN = experimentConfig.totalRuns || 20;
+            const raw = window.prompt(
+                'How many autopilot runs?\n(positive integer, 1-500)',
+                String(defaultN)
+            );
+            if (raw === null) return;                   // Cancel
+            const n = Math.floor(Number(raw));
+            if (!Number.isFinite(n) || n < 1 || n > 500) {
+                window.alert('Please enter a positive integer between 1 and 500.');
+                return;
+            }
             globalMode = 'TEST';
             experimentConfig.enabled = true;
+            experimentConfig.totalRuns = n;
             experimentConfig.runIndex = 0;
             experimentConfig.results.length = 0;
             experimentConfig.finished = false;

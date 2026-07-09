@@ -26,7 +26,7 @@ The mode-select screen has two sections:
 **Modes**:
 - **MANUAL** — fly the ship yourself with the keyboard.
 - **AUTOPILOT** — the autopilot plans a slingshot trajectory (numerical sweep of departure angles under simulated gravity) and flies the ship to Earth automatically.
-- **Ensemble test (20 autopilot runs)** — runs 20 fully-random autopilot trials back-to-back (each equivalent to clicking Autopilot with a new seed) and reports success rate, plus mean±sd of Earth-frame flight time, ship-frame flight time, time lost to relativistic dilation, and fuel used. A live top-right HUD tracks the running totals as trials complete. At the end, an **Adopt / Keep** dialog offers to persist the currently-active tuning parameters as the new defaults (or discard them).
+- **Ensemble test...** — pops up a prompt for the number of runs (1–500, default 20), then runs that many fully-random autopilot trials back-to-back (each equivalent to clicking Autopilot with a new seed) and reports success rate, plus mean±sd of Earth-frame flight time, ship-frame flight time, time lost to relativistic dilation, and fuel used. A live top-right HUD tracks the running totals as trials complete. At the end, an **Adopt / Keep** dialog offers to persist the currently-active tuning parameters as the new defaults (or discard them).
 - **Tuning (adjust parameters)** — opens a sliders panel for the autopilot's PID gains, cruise speed, Isp, deadline multiplier, etc. Values persist across page loads via `localStorage`.
 
 ## Controls (MANUAL mode)
@@ -48,7 +48,7 @@ The mode-select screen has two sections:
 
 Each run generates eight identical massive stars, all sharing the same radius, mass, and gravitational parameter. Their t=0 positions and velocities are sampled with essentially no structure — the only constraints are physical safety:
 
-- **Position** — uniform random over the whole world, rejection-sampled subject to (a) at least 10 star radii from Earth, (b) at least 5 star radii from the ship's spawn, (c) at least 4 star radii from any other star (numerical-stability floor for the N-body integrator).
+- **Position** — uniform random over a centered rectangle whose area is ~51% of the full world (linear factor ~0.716 per axis), keeping stars clustered nearer the play corridor. Rejection-sampled subject to (a) at least 10 star radii from Earth, (b) at least 5 star radii from the ship's spawn, (c) at least 4 star radii from any other star (numerical-stability floor for the N-body integrator).
 - **Velocity** — a common bulk drift of 200 world-units/s perpendicular to the S→E baseline (90° CCW), plus a per-star isotropic random kick with Gaussian(mean=100, sd=50) speed. The result is further rejection-sampled so the star's straight-line trajectory stays at least 10 star radii from Earth over the full gameplay horizon. The bulk drift sweeps the whole ensemble across the trajectory corridor while the random component preserves internal diffusive motion.
 
 That Earth-clearance filter (on both position and velocity) is what lets us safely neglect Earth-star gravitational coupling. The stars themselves then interact under full pairwise Newtonian gravity (symplectic Euler, both in the pre-flight trajectory sweep and in live gameplay).
