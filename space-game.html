@@ -47,8 +47,8 @@
         finished: false
     };
 
-    // TEMPORARY: compare-ensemble state (N seeds x 2 legs: slingshot then
-    // straight-line on the same seed, repeated for N random seeds).
+    // Compare-ensemble state (N seeds x 2 legs: slingshot then straight-line
+    // on the same seed, repeated for N random seeds).
     //   { totalSeeds, seedIndex, phase: 'slingshot'|'straight',
     //     slingshotResults: [], straightResults: [] }
     // Per-leg result: { success, reason, earthTime, shipTime, fuelUsed }.
@@ -273,7 +273,7 @@
         { key: 'Isp',           label: 'Specific impulse Isp (s)',     step: 25,   min: 100,  max: 1000, decimals: 0 }
     ];
 
-// Autopilot Controller with EKF and 5-phase state machine
+// Autopilot Controller with 5-phase state machine
 class AutopilotController {
     constructor(scene) {
         this.scene = scene;
@@ -2126,21 +2126,56 @@ class GameScene extends Phaser.Scene {
         } else {
             starList = [];
             const maxAttempts = 500;
+
+            // Uniform position within a rectangle whose *area* is 23.04% of
+            // the world (linear factor 0.8 * sqrt(0.8) * sqrt(0.75) * sqrt(0.6)
+            // ~= 0.4800). Successive reductions from the full world:
+            //   1.0 -> 0.64  (linear 0.8)
+            //       -> 0.512 (linear sqrt(0.8))
+            //       -> 0.384 (linear sqrt(0.75), 25% area cut)
+            //       -> 0.2304 (linear sqrt(0.6), further 40% area cut)
+            //
+            // The box is centered on the S-E midpoint (rather than on the
+            // world center) so the star cluster always straddles the ship's
+            // planned corridor even when the S-E chord doesn't happen to run
+            // through world center.
+            //
+            // Additionally, the center is pre-offset AGAINST the bulk-drift
+            // direction so the ensemble mean sweeps across the corridor and
+            // coincides with the S-E midpoint at roughly the moment the
+            // ship (flying at ~vCruise) reaches the ~1/4 point of the
+            // chord. Timing derivation: at cruise speed the ship reaches
+            // the quarter point at t_q = |SE| / (4 * vCruise), so the
+            // required lead-offset magnitude is
+            //     perpDriftMag * t_q = perpDriftMag * |SE| / (4 * vCruise).
+            // (Equivalently: half of the |SE|/(2*vCruise) offset that would
+            // sync the ensemble to the midpoint at the halfway mark.) The
+            // smaller lead keeps the box's world-bound clamp from saturating
+            // at low vCruise while still front-loading the star density
+            // toward the earlier, more decision-critical part of the run.
+            //
+            // The final center is clamped so the box stays fully inside the
+            // world bounds; otherwise a midpoint near a world edge (or a
+            // large pre-offset) would push half the box off-map and cluster
+            // all stars on the map-interior side.
+            const spawnShrink = 0.8 * Math.sqrt(0.8) * Math.sqrt(0.75) * Math.sqrt(0.6);
+            const boxW = this.worldWidth  * spawnShrink;
+            const boxH = this.worldHeight * spawnShrink;
+            const tShipToQuarter = 0.25 * lenSE / vCruiseClear;
+            const preOffX = -perpX * perpDriftMag * tShipToQuarter;
+            const preOffY = -perpY * perpDriftMag * tShipToQuarter;
+            const midX = 0.5 * (Sx + Ex) + preOffX;
+            const midY = 0.5 * (Sy + Ey) + preOffY;
+            const boxCenterX = Phaser.Math.Clamp(midX, boxW / 2, this.worldWidth  - boxW / 2);
+            const boxCenterY = Phaser.Math.Clamp(midY, boxH / 2, this.worldHeight - boxH / 2);
+            const boxMinX = boxCenterX - boxW / 2;
+            const boxMinY = boxCenterY - boxH / 2;
+
             for (let i = 0; i < numStars; i++) {
                 let placed = false;
                 for (let attempt = 0; attempt < maxAttempts; attempt++) {
-                    // Uniform position within a centered rectangle whose
-                    // *area* is 38.4% of the world (linear factor
-                    // 0.8 * sqrt(0.8) * sqrt(0.75) ~= 0.6196). Successive
-                    // reductions from the full world: 1.0 -> 0.64 (linear
-                    // 0.8), -> 0.512 (linear sqrt(0.8)), -> 0.384 (linear
-                    // sqrt(0.75), i.e. a 25% area cut). Keeps stars
-                    // clustered close to the play corridor.
-                    const spawnShrink = 0.8 * Math.sqrt(0.8) * Math.sqrt(0.75);
-                    const spawnMarginX = 0.5 * (1 - spawnShrink) * this.worldWidth;
-                    const spawnMarginY = 0.5 * (1 - spawnShrink) * this.worldHeight;
-                    const cx = spawnMarginX + Math.random() * (this.worldWidth  * spawnShrink);
-                    const cy = spawnMarginY + Math.random() * (this.worldHeight * spawnShrink);
+                    const cx = boxMinX + Math.random() * boxW;
+                    const cy = boxMinY + Math.random() * boxH;
 
                     // Earth clearance: t=0 position must be outside the
                     // clearance disk.
@@ -2302,11 +2337,35 @@ class GameScene extends Phaser.Scene {
         } else {
             bhList = [];
             const maxAttempts = 500;
+
+            // Reuse the star sampling box: same 23.04%-of-world shrink, same
+            // S-E-midpoint centering, same drift-lead pre-offset (based on
+            // the *star* ensemble's bulk drift, since the BH gets sampled
+            // into whatever region the stars occupy). Note the BH's own
+            // velocity is isotropic (no bulk drift), so the offset just
+            // co-locates the BH with the star cluster at t=0; it doesn't
+            // itself sweep the BH toward the S-E midpoint.
+            const spawnShrink = 0.8 * Math.sqrt(0.8) * Math.sqrt(0.75) * Math.sqrt(0.6);
+            const boxW = this.worldWidth  * spawnShrink;
+            const boxH = this.worldHeight * spawnShrink;
+            const starPerpDriftMag = 200;                    // matches createGravityObjects
+            const perpX = -dySE / lenSE;
+            const perpY =  dxSE / lenSE;
+            const tShipToQuarter = 0.25 * lenSE / vCruiseClear;
+            const preOffX = -perpX * starPerpDriftMag * tShipToQuarter;
+            const preOffY = -perpY * starPerpDriftMag * tShipToQuarter;
+            const midX = 0.5 * (Sx + Ex) + preOffX;
+            const midY = 0.5 * (Sy + Ey) + preOffY;
+            const boxCenterX = Phaser.Math.Clamp(midX, boxW / 2, this.worldWidth  - boxW / 2);
+            const boxCenterY = Phaser.Math.Clamp(midY, boxH / 2, this.worldHeight - boxH / 2);
+            const boxMinX = boxCenterX - boxW / 2;
+            const boxMinY = boxCenterY - boxH / 2;
+
             for (let i = 0; i < numBlackHoles; i++) {
                 let placed = false;
                 for (let attempt = 0; attempt < maxAttempts; attempt++) {
-                    const cx = Math.random() * this.worldWidth;
-                    const cy = Math.random() * this.worldHeight;
+                    const cx = boxMinX + Math.random() * boxW;
+                    const cy = boxMinY + Math.random() * boxH;
 
                     const dxS = cx - Sx, dyS = cy - Sy;
                     if (dxS * dxS + dyS * dyS < shipClear2) continue;
@@ -2575,8 +2634,8 @@ class GameScene extends Phaser.Scene {
         return true;
     }
 
-    // TEMPORARY: build a synthetic straight-line "slingshot plan" so the
-    // compare-test straight-line leg can reuse the entire autopilot code path
+    // Build a synthetic straight-line "slingshot plan" so the compare-test
+    // straight-line leg can reuse the entire autopilot code path
     // (BOOST / CRUISE / BRAKE + cross-track PID) with a straight reference
     // trajectory instead of a curved one.
     _buildStraightLinePlan() {
@@ -3636,13 +3695,24 @@ class GameScene extends Phaser.Scene {
         );
 
         // Stars (yellow filled circles, scaled physical radius clamped).
-        // Off-domain stars are simply omitted; the map keeps its fixed extent.
+        // Black holes get a distinct look: black filled disk with a purple
+        // annulus stroked around it, so they're immediately distinguishable
+        // from stars even at small radar-marker sizes.
+        // Off-domain objects are simply omitted; the map keeps its fixed extent.
         for (const s of stars) {
             const sp = toMap(s.x, s.y);
             if (!inPanel(sp)) continue;
             const sr = Math.max(3, Math.min(10, (s.radius || 0) * scale));
-            g.fillStyle(0xffdd33, 1.0);
-            g.fillCircle(sp.x, sp.y, sr);
+            const isBH = s.getData ? !!s.getData('isBlackHole') : false;
+            if (isBH) {
+                g.fillStyle(0x000000, 1.0);
+                g.fillCircle(sp.x, sp.y, sr);
+                g.lineStyle(2, 0xaa00ff, 1.0);
+                g.strokeCircle(sp.x, sp.y, sr);
+            } else {
+                g.fillStyle(0xffdd33, 1.0);
+                g.fillCircle(sp.x, sp.y, sr);
+            }
         }
 
         // Earth (blue filled circle).
@@ -3952,7 +4022,7 @@ class GameScene extends Phaser.Scene {
             }).setOrigin(1, 0).setScrollFactor(0).setDepth(1001);
         }
 
-        // TEMPORARY: compare-ensemble progress HUD (top-right).
+        // Compare-ensemble progress HUD (top-right).
         if (compareTestState) {
             const camW = this.cameras.main.width;
             const A = this._statsFrom(compareTestState.slingshotResults);
@@ -4012,10 +4082,16 @@ class GameScene extends Phaser.Scene {
         const centerY = h / 2;
 
         // Panel large enough to hold title, a "World options" section with
-        // four checkboxes, a "Mode" section with four buttons, and margins.
+        // four checkboxes, a "Mode" section with five buttons, and margins.
+        // Height derivation: last button center at centerY + 62 + 4*52 = +270
+        // (42px tall so extends to centerY + 291); 640 puts the panel bottom
+        // at centerY + 320, giving ~29px of breathing room.
         const panelWidth = 580;
-        const panelHeight = 540;
-        const bg = this.add.rectangle(centerX, centerY, panelWidth, panelHeight, 0x000000, 0.85)
+        const panelHeight = 640;
+        // Bg centered 50px below centerY so the extra vertical space added
+        // to fit the fifth button lands entirely below the button stack
+        // rather than being split evenly above the title.
+        const bg = this.add.rectangle(centerX, centerY + 50, panelWidth, panelHeight, 0x000000, 0.85)
             .setScrollFactor(0)
             .setDepth(3000)
             .setStrokeStyle(2, 0x00ffff, 0.6);
@@ -4112,7 +4188,7 @@ class GameScene extends Phaser.Scene {
         const buttonStartY = modeHeaderY + 34;
         const buttonSpacing = 52;
 
-        const makeButton = (label, index, handler) => {
+        const makeButton = (label, index, handler, fontSize = '20px') => {
             const y = buttonStartY + index * buttonSpacing;
             const btnBg = this.add.rectangle(centerX, y, 460, 42, 0x003344, 0.9)
                 .setScrollFactor(0)
@@ -4120,7 +4196,7 @@ class GameScene extends Phaser.Scene {
                 .setStrokeStyle(1, 0x00ffff, 0.5)
                 .setInteractive({ useHandCursor: true });
             const btnText = this.add.text(centerX, y, label, {
-                fontSize: '20px',
+                fontSize,
                 fill: '#0ff'
             }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
             btnBg.on('pointerdown', handler);
@@ -4167,9 +4243,10 @@ class GameScene extends Phaser.Scene {
             this.scene.restart();
         });
 
-        // TEMPORARY: ensemble comparison test (slingshot vs straight-line).
-        // Runs N seeds, each yielding one slingshot + one straight-line trial
-        // on the same seed (so 2N total trials but only N random draws).
+        // Ensemble comparison test (slingshot vs straight-line). Runs N seeds,
+        // each yielding one slingshot + one straight-line trial on the same
+        // seed (so 2N total trials but only N random draws). Uses a smaller
+        // font so the long label fits inside the shared 460-wide button.
         makeButton('Compare ensemble: slingshot vs straight-line...', 3, () => {
             const raw = window.prompt(
                 'How many seeds?\n(each seed = 1 slingshot + 1 straight-line trial,\n so total trials = 2 * N. Range 1-200.)',
@@ -4193,7 +4270,7 @@ class GameScene extends Phaser.Scene {
             };
             elements.forEach(e => e.destroy());
             this.scene.restart();
-        });
+        }, '15px');
 
         makeButton('Tuning (adjust parameters)', 4, () => {
             globalMode = 'MENU';
@@ -5196,14 +5273,37 @@ class GameScene extends Phaser.Scene {
         }
 
         // Gravity objects (stars / black holes): size scales with the true
-        // world radius so the star appears at its actual size on the radar.
+        // world radius so the object appears at its actual size on the radar.
+        // Stars render as a filled yellow disk; black holes get a distinct
+        // treatment (black center + stroked purple annulus) so the two are
+        // instantly distinguishable at a glance.
         this.gravityObjects.forEach(obj => {
-            const isStar = obj.getData('isStar');
-            const color = isStar ? 0xffff00 : 0xaa00ff;
+            const isBH = obj.getData('isBlackHole');
             const worldR = (typeof obj.radius === 'number' && obj.radius > 0)
                 ? obj.radius
                 : null;
-            drawLocalMarker(obj.x, obj.y, color, 3, worldR);
+            if (!isBH) {
+                drawLocalMarker(obj.x, obj.y, 0xffff00, 3, worldR);
+                return;
+            }
+            // Black-hole annulus marker: inlined instead of extending
+            // drawLocalMarker so the ring/fill can be styled independently.
+            const dx = obj.x - this.player.x;
+            const dy = obj.y - this.player.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > radarRange) return;
+            const angleObj = Math.atan2(dy, dx);
+            const quantAng = Math.round(angleObj / step) * step;
+            const rMap = (dist / radarRange) * radiusEdge;
+            const mx2 = radarX + Math.cos(quantAng) * rMap;
+            const my2 = radarY + Math.sin(quantAng) * rMap;
+            const markerR = (worldR !== null)
+                ? Math.max(3, worldR * worldToRadar)
+                : 4;
+            this.radar.fillStyle(0x000000, 1);
+            this.radar.fillCircle(mx2, my2, markerR);
+            this.radar.lineStyle(2, 0xaa00ff, 1);
+            this.radar.strokeCircle(mx2, my2, markerR);
         });
 
         // Asteroids
@@ -5274,7 +5374,7 @@ class GameScene extends Phaser.Scene {
         this.gameOver = true;
         this.lastLoseReason = reason || 'COLLISION';
 
-        // TEMPORARY: compare-test routing on failure.
+        // Compare-test routing on failure.
         if (this.mode === 'COMPARE' && compareTestState) {
             this._recordCompareResult(false);
             this._advanceCompareTest();
@@ -5352,7 +5452,7 @@ class GameScene extends Phaser.Scene {
 
         this.gameOver = true;
 
-        // TEMPORARY: compare-test routing on success.
+        // Compare-test routing on success.
         if (this.mode === 'COMPARE' && compareTestState) {
             this._recordCompareResult(true);
             this._advanceCompareTest();
@@ -5499,7 +5599,7 @@ class GameScene extends Phaser.Scene {
         });
     }
 
-    // TEMPORARY: compare-ensemble helpers --------------------------------
+    // Compare-ensemble helpers ------------------------------------------
     _recordCompareResult(success) {
         const result = {
             success,
