@@ -136,6 +136,45 @@
         return currentMainThrustForce() / currentShipMass(scene);
     }
 
+    // Speed of light in game units. Also used locally in the time-dilation
+    // calculation (see time-dilation function), but centralized here so the
+    // thrust and dilation codepaths stay in sync.
+    const SPEED_OF_LIGHT = 400;
+
+    // Relativistic thrust acceleration. Given a lab-frame force vector
+    // (Fx, Fy), the ship's rest mass, and its current velocity (vx, vy),
+    // returns the acceleration vector (ax, ay) implied by Newton's second
+    // law in its relativistic form F = dp/dt with p = gamma * m * v.
+    //
+    // Split into components along and perpendicular to the current velocity:
+    //     a_parallel = F_parallel / (m * gamma^3)
+    //     a_perp     = F_perp     / (m * gamma)
+    // At v = 0 there is no distinguished direction, gamma = 1, and this
+    // collapses to the Newtonian a = F/m. As v -> c, longitudinal
+    // acceleration -> 0 (classic "asymptote to c") while transverse
+    // acceleration merely scales down by 1/gamma.
+    function relativisticThrustAccel(Fx, Fy, mass, vx, vy) {
+        const c = SPEED_OF_LIGHT;
+        const v2 = vx * vx + vy * vy;
+        let beta2 = v2 / (c * c);
+        if (beta2 < 0) beta2 = 0;
+        if (beta2 > 0.999999) beta2 = 0.999999;
+        const gamma = 1 / Math.sqrt(1 - beta2);
+        if (v2 < 1e-12) {
+            return { ax: Fx / mass, ay: Fy / mass };
+        }
+        const vMag = Math.sqrt(v2);
+        const vhx = vx / vMag, vhy = vy / vMag;
+        const Fpar   = Fx * vhx + Fy * vhy;
+        const Fperx  = Fx - Fpar * vhx;
+        const Fpery  = Fy - Fpar * vhy;
+        const denomP = mass * gamma * gamma * gamma;
+        const denomT = mass * gamma;
+        const ax = (Fpar / denomP) * vhx + Fperx / denomT;
+        const ay = (Fpar / denomP) * vhy + Fpery / denomT;
+        return { ax, ay };
+    }
+
     function cloneTuningParams(src) {
         return {
             vCruise: src.vCruise,
@@ -1266,11 +1305,14 @@ class AutopilotController {
             const scale = typeof control.thrustScale === 'number' ? control.thrustScale : 1.0;
             const F = currentMainThrustForce() * scale;
             const mass = currentShipMass(this.scene);
-            const accel = F / mass;
-            const vx = Math.cos(this.scene.playerAngle) * accel * dt;
-            const vy = Math.sin(this.scene.playerAngle) * accel * dt;
-            this.scene.player.body.velocity.x += vx;
-            this.scene.player.body.velocity.y += vy;
+            // Lab-frame thrust vector along the ship's current heading, then
+            // apply relativistic F = dp/dt to get the actual acceleration.
+            const Fx = Math.cos(this.scene.playerAngle) * F;
+            const Fy = Math.sin(this.scene.playerAngle) * F;
+            const vNow = this.scene.player.body.velocity;
+            const aRel = relativisticThrustAccel(Fx, Fy, mass, vNow.x, vNow.y);
+            this.scene.player.body.velocity.x += aRel.ax * dt;
+            this.scene.player.body.velocity.y += aRel.ay * dt;
             this.scene.isThrusting = true;
 
             const vExhaust = currentExhaustVelocity();
@@ -1284,10 +1326,19 @@ class AutopilotController {
             const aLat = Phaser.Math.Clamp(control.lateralThrust, -this.getMaxLateralAccel(), this.getMaxLateralAccel());
             const perpX = -Math.sin(this.scene.playerAngle);
             const perpY = Math.cos(this.scene.playerAngle);
-            const dvx = perpX * aLat * dt;
-            const dvy = perpY * aLat * dt;
-            this.scene.player.body.velocity.x += dvx;
-            this.scene.player.body.velocity.y += dvy;
+            // Treat the controller's commanded lateral acceleration as a
+            // Newtonian equivalent, back out the required lab-frame force
+            // F_lat = m * aLat, then apply F = dp/dt to get the true
+            // relativistic acceleration (which will be reduced by 1/gamma
+            // for the purely-transverse case and by more if the ship's
+            // velocity has any component along the lateral direction).
+            const mass = currentShipMass(this.scene);
+            const Fx = perpX * aLat * mass;
+            const Fy = perpY * aLat * mass;
+            const vNow = this.scene.player.body.velocity;
+            const aRel = relativisticThrustAccel(Fx, Fy, mass, vNow.x, vNow.y);
+            this.scene.player.body.velocity.x += aRel.ax * dt;
+            this.scene.player.body.velocity.y += aRel.ay * dt;
 
             // Rocket-equation fuel burn for lateral thrusters. To produce a
             // commanded acceleration aLat on the current ship mass, the
@@ -1296,7 +1347,6 @@ class AutopilotController {
             // same one used for the main engine, so main-vs-side fuel usage
             // stays in exact proportion to their instantaneous thrust.
             const vExhaust = currentExhaustVelocity();
-            const mass = currentShipMass(this.scene);
             const F_lat = Math.abs(aLat) * mass;
             totalFuelUse += FUEL_BURN_MULTIPLIER * F_lat * dt / vExhaust;
 
@@ -2883,14 +2933,37 @@ class GameScene extends Phaser.Scene {
 
         const maxSteps = Math.floor(maxTime / dt);
 
-        // Helper to simulate a single trajectory for a given heading angle
+        // Thrust / fuel parameters (constant across all candidates because
+        // Isp is a tuning parameter, not a per-trajectory quantity).
+        const thrustForce   = currentMainThrustForce();
+        const exhaustVel    = currentExhaustVelocity();
+        const fuelBurnRate  = FUEL_BURN_MULTIPLIER * thrustForce / exhaustVel;
+        const initialFuel   = INITIAL_FUEL_MASS;
+        const dryMass       = SHIP_DRY_MASS;
+        const vCruise2      = vCruise * vCruise;   // squared-speed threshold
+
+        // Helper to simulate a single trajectory for a given heading angle.
+        // Model: BOOST phase (constant thrust along the departure direction,
+        // fuel-mass drain) until |v| >= vCruise or fuel = 0, then ballistic
+        // coasting under full N-body star gravity. This closes the "planned
+        // vs actual" trajectory gap that arose from the previous model's
+        // instantaneous launch at cruise speed with fixed mass.
         const simulateForAngle = (angleOffset) => {
             let x = Sx;
             let y = Sy;
             const cosA = Math.cos(angleOffset);
             const sinA = Math.sin(angleOffset);
-            let vx = vCruise * (uxBase * cosA - uyBase * sinA);
-            let vy = vCruise * (uxBase * sinA + uyBase * cosA);
+            // Departure unit direction (was previously used only to seed the
+            // initial velocity). Also the direction of thrust during BOOST.
+            const dirX = uxBase * cosA - uyBase * sinA;
+            const dirY = uxBase * sinA + uyBase * cosA;
+            // Ship starts at rest -- BOOST accelerates it to vCruise.
+            let vx = 0;
+            let vy = 0;
+            // Fuel / mass state. Live gameplay drains fuel from
+            // INITIAL_FUEL_MASS with the same rate as here.
+            let fuel = initialFuel;
+            let boosting = true;
 
             // Per-trial mutable star state. Each trial starts the stars back
             // at their t=0 initial conditions and evolves them under mutual
@@ -2946,6 +3019,23 @@ class GameScene extends Phaser.Scene {
                 let ax = 0;
                 let ay = 0;
                 let killed = false;
+
+                // 1a) BOOST-phase thrust along the departure direction. Ends
+                //     when the ship reaches cruise speed or runs out of fuel.
+                //     Uses relativistic F = dp/dt so the ship asymptotes to c
+                //     instead of exceeding it, matching the live-flight model.
+                if (boosting) {
+                    const mass = dryMass + fuel;
+                    const Fx = dirX * thrustForce;
+                    const Fy = dirY * thrustForce;
+                    const aRel = relativisticThrustAccel(Fx, Fy, mass, vx, vy);
+                    ax += aRel.ax;
+                    ay += aRel.ay;
+                    // Burn fuel this step (clamped so we never go negative).
+                    fuel -= fuelBurnRate * dt;
+                    if (fuel <= 0) { fuel = 0; boosting = false; }
+                }
+
                 for (let i = 0; i < N; i++) {
                     const dxCS = starX[i] - x;
                     const dyCS = starY[i] - y;
@@ -3012,6 +3102,9 @@ class GameScene extends Phaser.Scene {
                 // 3) Symplectic-Euler update: velocities first, then positions.
                 vx += ax * dt;
                 vy += ay * dt;
+                if (boosting && (vx * vx + vy * vy) >= vCruise2) {
+                    boosting = false;   // reached cruise speed; cut thrust
+                }
                 for (let i = 0; i < N; i++) {
                     starVX[i] += starAX[i] * dt;
                     starVY[i] += starAY[i] * dt;
@@ -4612,10 +4705,21 @@ class GameScene extends Phaser.Scene {
         if (this.cursors.up.isDown && this.fuel > 0) {
             const F = currentMainThrustForce();
             const mass = currentShipMass(this);
-            const accel = F / mass;
-            const thrustX = Math.cos(this.playerAngle) * accel;
-            const thrustY = Math.sin(this.playerAngle) * accel;
-            this.player.body.setAcceleration(thrustX, thrustY);
+            // Lab-frame thrust vector along the ship's current heading.
+            // Apply relativistic F = dp/dt: acceleration decreases with
+            // gamma (transversely) or gamma^3 (longitudinally), so the
+            // ship asymptotes to c instead of exceeding it. Applied as a
+            // per-frame velocity impulse (Phaser's setAcceleration would
+            // assume the acceleration is constant across the physics
+            // sub-step, which is not true under SR because a depends on
+            // the instantaneous velocity).
+            const Fx = Math.cos(this.playerAngle) * F;
+            const Fy = Math.sin(this.playerAngle) * F;
+            const vNow = this.player.body.velocity;
+            const aRel = relativisticThrustAccel(Fx, Fy, mass, vNow.x, vNow.y);
+            this.player.body.setAcceleration(0, 0);
+            this.player.body.velocity.x += aRel.ax * dt;
+            this.player.body.velocity.y += aRel.ay * dt;
             this.isThrusting = true;
 
             const vExhaust = currentExhaustVelocity();
