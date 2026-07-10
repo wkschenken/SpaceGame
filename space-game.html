@@ -112,11 +112,6 @@
     // Jet power chosen so F(Isp = ISP_REF) = REFERENCE_THRUST_FORCE.
     // With v_e halved, this is automatically half its previous value.
     const MAIN_JET_POWER = 0.5 * REFERENCE_THRUST_FORCE * REFERENCE_EXHAUST_VELOCITY;
-    // Gameplay tuning: propellant is consumed 50% faster than the ideal
-    // rocket-equation mass-flow rate F/v_e would predict, applied uniformly
-    // to both the main engine and the side thrusters so their fuel usage
-    // stays in the same proportion as their thrust.
-    const FUEL_BURN_MULTIPLIER = 1.5;
 
     function currentShipMass(scene) {
         return SHIP_DRY_MASS + Math.max(0, scene.fuel);
@@ -1316,7 +1311,7 @@ class AutopilotController {
             this.scene.isThrusting = true;
 
             const vExhaust = currentExhaustVelocity();
-            totalFuelUse += FUEL_BURN_MULTIPLIER * F * dt / vExhaust;
+            totalFuelUse += F * dt / vExhaust;
         } else {
             this.scene.isThrusting = false;
         }
@@ -1343,12 +1338,12 @@ class AutopilotController {
             // Rocket-equation fuel burn for lateral thrusters. To produce a
             // commanded acceleration aLat on the current ship mass, the
             // required force is F_lat = m * |aLat|; fuel consumed is
-            // FUEL_BURN_MULTIPLIER * F_lat * dt / v_e. The multiplier is the
-            // same one used for the main engine, so main-vs-side fuel usage
-            // stays in exact proportion to their instantaneous thrust.
+            // F_lat * dt / v_e (same ideal mass-flow formula as the main
+            // engine, so main-vs-side fuel usage stays in exact proportion
+            // to their instantaneous thrust).
             const vExhaust = currentExhaustVelocity();
             const F_lat = Math.abs(aLat) * mass;
-            totalFuelUse += FUEL_BURN_MULTIPLIER * F_lat * dt / vExhaust;
+            totalFuelUse += F_lat * dt / vExhaust;
 
             // Visual flags for side thrusters. Positive lateral acceleration
             // pushes the ship to its left (in the ship's local frame), which
@@ -2937,7 +2932,7 @@ class GameScene extends Phaser.Scene {
         // Isp is a tuning parameter, not a per-trajectory quantity).
         const thrustForce   = currentMainThrustForce();
         const exhaustVel    = currentExhaustVelocity();
-        const fuelBurnRate  = FUEL_BURN_MULTIPLIER * thrustForce / exhaustVel;
+        const fuelBurnRate  = thrustForce / exhaustVel;
         const initialFuel   = INITIAL_FUEL_MASS;
         const dryMass       = SHIP_DRY_MASS;
         const vCruise2      = vCruise * vCruise;   // squared-speed threshold
