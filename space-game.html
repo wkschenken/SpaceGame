@@ -47,6 +47,14 @@
         finished: false
     };
 
+    // TEMPORARY: compare-ensemble state (N seeds x 2 legs: slingshot then
+    // straight-line on the same seed, repeated for N random seeds).
+    //   { totalSeeds, seedIndex, phase: 'slingshot'|'straight',
+    //     slingshotResults: [], straightResults: [] }
+    // Per-leg result: { success, reason, earthTime, shipTime, fuelUsed }.
+    let compareTestState = null;
+    let lastCompareSeedCount = 10;
+
     const baseTuningParams = {
         vCruise: 250,
         brakeDistScale: 1.25,
@@ -89,16 +97,20 @@
     // Both thrust and mass flow rate fall as v_e (equivalently Isp) grows,
     // reproducing the real chemical-vs-ion tradeoff without ad-hoc physics.
     //
-    // Calibration: at the reference Isp = 300 s, v_e = 10000 (game units),
-    // giving F = 22500 (peak accel 150 at full tank) and m_dot = 2.25 fuel/s,
-    // which matches the previous constant-thrust behavior exactly.
+    // Calibration: at the reference Isp = 300 s, v_e = 5000 (game units),
+    // giving F = 22500 (peak accel 150 at full tank) and m_dot = 4.5 fuel/s.
+    // Both v_e and P_jet were halved from the earlier 10000 / 112.5M pair;
+    // since F = 2 P_jet / v_e, halving both leaves thrust unchanged, while
+    // m_dot = 2 P_jet / v_e^2 doubles (2.25 -> 4.5 fuel/s). Fuel therefore
+    // burns twice as fast for the same thrust profile.
     const SHIP_DRY_MASS = 50;
     const INITIAL_FUEL_MASS = 100;
     const ISP_REF = 300;
-    const ISP_TO_VE = 10000 / ISP_REF; // so v_e(Isp=300) = 10000
+    const ISP_TO_VE = 5000 / ISP_REF; // so v_e(Isp=300) = 5000
     const REFERENCE_THRUST_FORCE = 150 * (SHIP_DRY_MASS + INITIAL_FUEL_MASS); // 22500
-    const REFERENCE_EXHAUST_VELOCITY = ISP_REF * ISP_TO_VE; // 10000
+    const REFERENCE_EXHAUST_VELOCITY = ISP_REF * ISP_TO_VE; // 5000
     // Jet power chosen so F(Isp = ISP_REF) = REFERENCE_THRUST_FORCE.
+    // With v_e halved, this is automatically half its previous value.
     const MAIN_JET_POWER = 0.5 * REFERENCE_THRUST_FORCE * REFERENCE_EXHAUST_VELOCITY;
     // Gameplay tuning: propellant is consumed 50% faster than the ideal
     // rocket-equation mass-flow rate F/v_e would predict, applied uniformly
@@ -1419,9 +1431,9 @@ class GameScene extends Phaser.Scene {
         this.minimapLabel = null;
         this.starMotionStarted = false;
 
-        // Plan a slingshot path only in AUTOPILOT / TEST modes. MANUAL play
-        // has no planning phase and no autopilot.
-        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST') {
+        // Plan a slingshot path only in AUTOPILOT / TEST / COMPARE modes.
+        // MANUAL play has no planning phase and no autopilot.
+        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST' || this.mode === 'COMPARE') {
             this.refineSlingshotPlanNumerically();
         }
         
@@ -2073,13 +2085,13 @@ class GameScene extends Phaser.Scene {
                 let placed = false;
                 for (let attempt = 0; attempt < maxAttempts; attempt++) {
                     // Uniform position within a centered rectangle whose
-                    // *area* is 51.2% of the world (linear factor
-                    // 0.8 * sqrt(0.8) ~= 0.7155). This is two successive
-                    // 20% area-reductions from the full world (1.0 -> 0.64
-                    // via linear 0.8; then 0.64 -> 0.512 via linear
-                    // sqrt(0.8)). Keeps stars clustered closer to the play
-                    // corridor rather than the world edges.
-                    const spawnShrink = 0.8 * Math.sqrt(0.8);
+                    // *area* is 38.4% of the world (linear factor
+                    // 0.8 * sqrt(0.8) * sqrt(0.75) ~= 0.6196). Successive
+                    // reductions from the full world: 1.0 -> 0.64 (linear
+                    // 0.8), -> 0.512 (linear sqrt(0.8)), -> 0.384 (linear
+                    // sqrt(0.75), i.e. a 25% area cut). Keeps stars
+                    // clustered close to the play corridor.
+                    const spawnShrink = 0.8 * Math.sqrt(0.8) * Math.sqrt(0.75);
                     const spawnMarginX = 0.5 * (1 - spawnShrink) * this.worldWidth;
                     const spawnMarginY = 0.5 * (1 - spawnShrink) * this.worldHeight;
                     const cx = spawnMarginX + Math.random() * (this.worldWidth  * spawnShrink);
@@ -2425,6 +2437,135 @@ class GameScene extends Phaser.Scene {
         }
     }
 
+    // Planner-status banner: screen-fixed top-center text that lingers a
+    // few seconds then fades. Used to surface the chord-check result in
+    // AUTOPILOT mode ("straight line cleared" vs "not safe, computing
+    // slingshot"). Destroys any previous banner so successive planner
+    // calls (e.g. on scene restart) don't stack.
+    _showPlannerBanner(message, colorHex) {
+        if (this._plannerBanner) {
+            this._plannerBanner.destroy();
+            this._plannerBanner = null;
+        }
+        const camW = this.cameras.main.width;
+        const banner = this.add.text(camW / 2, 110, message, {
+            fontSize: '22px',
+            fill: colorHex || '#66ff88',
+            backgroundColor: '#000c',
+            padding: { x: 18, y: 10 },
+            fontFamily: 'monospace',
+            align: 'center'
+        }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(2000);
+        this._plannerBanner = banner;
+        this.tweens.add({
+            targets: banner,
+            alpha: 0,
+            delay: 2500,
+            duration: 1000,
+            onComplete: () => {
+                if (this._plannerBanner === banner) this._plannerBanner = null;
+                banner.destroy();
+            }
+        });
+    }
+
+    // Chord-clearance test for the straight-line planner. Returns true iff,
+    // over the ship's expected transit along the S->E chord, every star's
+    // (moving) center stays at least (starR + shipR + margin) away from the
+    // (moving) ship center.
+    //
+    // Model:
+    //   Ship position:   P_ship(t) = S + v_ship * t,   v_ship = vCruise * uSE,
+    //                    for t in [0, T] where T = |SE| / vCruise.
+    //   Star position:   P_star(t) = (x0, y0) + (vx, vy) * t   (linear).
+    //   Relative offset: r(t) = P_star(t) - P_ship(t) = r0 + dv * t.
+    //   Analytical min of |r(t)|^2 over t in [0, T] is at
+    //       t* = clamp(-(r0 . dv) / |dv|^2, 0, T)
+    //   (or t* = 0 if |dv| = 0). Test distance at t* against the threshold.
+    //
+    // This is a linear-motion approximation: the real ship has BOOST/BRAKE
+    // phases (slower average speed than vCruise). Slower ships give stars
+    // more time to drift into the path, so using vCruise here is optimistic.
+    // The 20-unit margin buffers this and other small modeling errors.
+    _straightLineClearsStars() {
+        if (!this.gravityObjects || this.gravityObjects.length === 0) return true;
+        const Sx = this.startX, Sy = this.startY;
+        const Ex = this.earthX, Ey = this.earthY;
+        const dxSE = Ex - Sx, dySE = Ey - Sy;
+        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
+        if (lenSE < 1e-6) return true;
+        const uSEx = dxSE / lenSE, uSEy = dySE / lenSE;
+        const vCruise = (activeTuningParams && activeTuningParams.vCruise) || 250;
+        const vShipX = vCruise * uSEx, vShipY = vCruise * uSEy;
+        const T = lenSE / vCruise;               // expected transit time
+        const shipR = 15;
+        const margin = 20;
+
+        for (const obj of this.gravityObjects) {
+            const x0  = (typeof obj.getData('x0')  === 'number') ? obj.getData('x0')  : obj.x;
+            const y0  = (typeof obj.getData('y0')  === 'number') ? obj.getData('y0')  : obj.y;
+            const svx = (typeof obj.getData('vx')  === 'number') ? obj.getData('vx')  : 0;
+            const svy = (typeof obj.getData('vy')  === 'number') ? obj.getData('vy')  : 0;
+            const starR = obj.radius || 0;
+            const threshold = starR + shipR + margin;
+
+            // r(t) = r0 + dv * t
+            const r0x = x0 - Sx,      r0y = y0 - Sy;
+            const dvx = svx - vShipX, dvy = svy - vShipY;
+            const dv2 = dvx * dvx + dvy * dvy;
+
+            let tStar;
+            if (dv2 < 1e-9) {
+                tStar = 0;                       // no relative motion
+            } else {
+                tStar = -(r0x * dvx + r0y * dvy) / dv2;
+                if (tStar < 0) tStar = 0;
+                else if (tStar > T) tStar = T;
+            }
+            const rx = r0x + dvx * tStar;
+            const ry = r0y + dvy * tStar;
+            const dist = Math.sqrt(rx * rx + ry * ry);
+            if (dist < threshold) return false;
+        }
+        return true;
+    }
+
+    // TEMPORARY: build a synthetic straight-line "slingshot plan" so the
+    // compare-test straight-line leg can reuse the entire autopilot code path
+    // (BOOST / CRUISE / BRAKE + cross-track PID) with a straight reference
+    // trajectory instead of a curved one.
+    _buildStraightLinePlan() {
+        const Sx = this.startX, Sy = this.startY;
+        const Ex = this.earthX, Ey = this.earthY;
+        const dx = Ex - Sx, dy = Ey - Sy;
+        const len = Math.max(1e-6, Math.sqrt(dx * dx + dy * dy));
+        const ux = dx / len, uy = dy / len;      // S->E unit vector
+        const tx = -uy, ty = ux;                 // 90 deg CCW (tangent)
+
+        // Dense straight-line polyline so getSlingshotPathFrame's O(N)
+        // nearest-segment walk gives fine-grained cross-track error.
+        const numSegs = 100;
+        const trajectoryPoints = [];
+        for (let i = 0; i <= numSegs; i++) {
+            const t = i / numSegs;
+            trajectoryPoints.push({ x: Sx + dx * t, y: Sy + dy * t });
+        }
+
+        return {
+            startX: Sx, startY: Sy,
+            earthX: Ex, earthY: Ey,
+            baseUx: ux, baseUy: uy,
+            object: null,
+            impactParameter: 0,
+            deflectionAngle: 0,
+            dirX: ux, dirY: uy,
+            tangentX: tx, tangentY: ty,
+            outDirX: ux, outDirY: uy,
+            trajectoryPoints,
+            periIndex: 0
+        };
+    }
+
     refineSlingshotPlanNumerically() {
         // Initialize the incremental numerical sweep state. The actual work is
         // performed in updateSlingshotSweep() so we can display progress and
@@ -2435,6 +2576,43 @@ class GameScene extends Phaser.Scene {
         // (Stale per-scene references are already cleared in create().)
         this.slingshotDebug = this.add.graphics();
         this.slingshotDebug.setDepth(500);
+
+        // Default autopilot planner behavior: first check whether the direct
+        // S->E chord clears every star (by ship-radius + margin). If it does,
+        // install a synthesized straight-line plan and skip the numerical
+        // slingshot sweep entirely -- straight-line flight is faster,
+        // cheaper in fuel, and lower in time dilation whenever it's safe.
+        // Only when the chord clips a star do we fall through and run the
+        // sweep to find a curved slingshot trajectory.
+        //
+        // Exception: the slingshot leg of the compare-ensemble test bypasses
+        // the chord shortcut so that leg *always* runs the slingshot sweep,
+        // preserving the slingshot-vs-straight comparison. The straight leg
+        // uses the normal shortcut and marks itself as a "fallback" if the
+        // chord happened to clip a star.
+        const isCompareSlingshotLeg = this.mode === 'COMPARE' && compareTestState
+            && compareTestState.phase === 'slingshot';
+        this._compareLegUsedFallback = false;
+        if (!isCompareSlingshotLeg) {
+            const clear = this._straightLineClearsStars();
+            if (this.mode === 'AUTOPILOT') {
+                if (clear) {
+                    this._showPlannerBanner('Straight line path has been cleared', '#66ff88');
+                } else {
+                    this._showPlannerBanner('Straight line trajectory not safe. Calculating slingshot...', '#ffcc66');
+                }
+            }
+            if (clear) {
+                this.slingshotPlan = this._buildStraightLinePlan();
+                this.slingshotSweepActive = false;
+                this.slingshotSweepFailed = false;
+                return;
+            }
+            if (this.mode === 'COMPARE' && compareTestState
+                && compareTestState.phase === 'straight') {
+                this._compareLegUsedFallback = true;
+            }
+        }
 
         if (!this.gravityObjects || this.gravityObjects.length === 0) {
             return;
@@ -3686,6 +3864,35 @@ class GameScene extends Phaser.Scene {
             }).setOrigin(1, 0).setScrollFactor(0).setDepth(1001);
         }
 
+        // TEMPORARY: compare-ensemble progress HUD (top-right).
+        if (compareTestState) {
+            const camW = this.cameras.main.width;
+            const A = this._statsFrom(compareTestState.slingshotResults);
+            const B = this._statsFrom(compareTestState.straightResults);
+            const pct = (x) => (x * 100).toFixed(1);
+            const rate = (s) => (s.totalCompleted > 0)
+                ? `${s.successCount}/${s.totalCompleted} (${pct(s.successRate)}%)`
+                : '-';
+            const seedNum = Math.min(compareTestState.seedIndex + 1, compareTestState.totalSeeds);
+            const lines = [];
+            lines.push(`COMPARE ENSEMBLE  seed ${seedNum}/${compareTestState.totalSeeds}`);
+            lines.push(`  leg: ${compareTestState.phase.toUpperCase()}`);
+            lines.push('');
+            lines.push(`  slingshot:  ${rate(A)}`);
+            lines.push(`  straight :  ${rate(B)}`);
+            if (B.fallbackCount > 0) {
+                lines.push(`    fallbacks: ${B.fallbackCount}/${B.totalCompleted}`);
+            }
+            this.compareProgressText = this.add.text(camW - 10, 10, lines.join('\n'), {
+                fontSize: '14px',
+                fill: '#ffdd66',
+                backgroundColor: '#000a',
+                padding: { x: 10, y: 6 },
+                fontFamily: 'monospace',
+                align: 'left'
+            }).setOrigin(1, 0).setScrollFactor(0).setDepth(1001);
+        }
+
         
         // Instructions
         this.add.text(
@@ -3872,7 +4079,35 @@ class GameScene extends Phaser.Scene {
             this.scene.restart();
         });
 
-        makeButton('Tuning (adjust parameters)', 3, () => {
+        // TEMPORARY: ensemble comparison test (slingshot vs straight-line).
+        // Runs N seeds, each yielding one slingshot + one straight-line trial
+        // on the same seed (so 2N total trials but only N random draws).
+        makeButton('Compare ensemble: slingshot vs straight-line...', 3, () => {
+            const raw = window.prompt(
+                'How many seeds?\n(each seed = 1 slingshot + 1 straight-line trial,\n so total trials = 2 * N. Range 1-200.)',
+                String(lastCompareSeedCount)
+            );
+            if (raw === null) return;
+            const n = Math.floor(Number(raw));
+            if (!Number.isFinite(n) || n < 1 || n > 200) {
+                window.alert('Please enter a positive integer between 1 and 200.');
+                return;
+            }
+            lastCompareSeedCount = n;
+            globalMode = 'COMPARE';
+            experimentConfig.enabled = false;
+            compareTestState = {
+                totalSeeds: n,
+                seedIndex: 0,
+                phase: 'slingshot',
+                slingshotResults: [],
+                straightResults: []
+            };
+            elements.forEach(e => e.destroy());
+            this.scene.restart();
+        });
+
+        makeButton('Tuning (adjust parameters)', 4, () => {
             globalMode = 'MENU';
             elements.forEach(e => e.destroy());
             this.showTuningScreen();
@@ -4023,9 +4258,9 @@ class GameScene extends Phaser.Scene {
         // Background starfield is rendered once at scene setup and left
         // untouched thereafter (bgStars are screen-fixed and non-animated).
         
-        // For AUTOPILOT and TEST modes, run the numerical slingshot sweep
-        // first (if applicable), then enable and update autopilot.
-        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST') {
+        // For AUTOPILOT / TEST / COMPARE modes, run the numerical slingshot
+        // sweep first (if applicable), then enable and update autopilot.
+        if (this.mode === 'AUTOPILOT' || this.mode === 'TEST' || this.mode === 'COMPARE') {
             this.updateSlingshotSweep(delta / 1000);
             // Enable autopilot only once the sweep has finished AND a viable
             // trajectory was found. If no massive objects are present the
@@ -4940,6 +5175,13 @@ class GameScene extends Phaser.Scene {
         this.gameOver = true;
         this.lastLoseReason = reason || 'COLLISION';
 
+        // TEMPORARY: compare-test routing on failure.
+        if (this.mode === 'COMPARE' && compareTestState) {
+            this._recordCompareResult(false);
+            this._advanceCompareTest();
+            return;
+        }
+
         // Record experiment failure if enabled
         if (experimentConfig.enabled && !experimentConfig.finished) {
             experimentConfig.results.push({
@@ -5010,6 +5252,13 @@ class GameScene extends Phaser.Scene {
         }
 
         this.gameOver = true;
+
+        // TEMPORARY: compare-test routing on success.
+        if (this.mode === 'COMPARE' && compareTestState) {
+            this._recordCompareResult(true);
+            this._advanceCompareTest();
+            return;
+        }
 
         // Record experiment success if enabled
         if (experimentConfig.enabled && !experimentConfig.finished) {
@@ -5150,6 +5399,151 @@ class GameScene extends Phaser.Scene {
             this.scene.restart();
         });
     }
+
+    // TEMPORARY: compare-ensemble helpers --------------------------------
+    _recordCompareResult(success) {
+        const result = {
+            success,
+            reason: success ? null : (this.lastLoseReason || 'COLLISION'),
+            earthTime: this.earthTime || 0,
+            shipTime: this.shipTime || 0,
+            lostTime: (this.earthTime || 0) - (this.shipTime || 0),
+            fuelUsed: 100 - (this.fuel || 0),
+            fellBack: !!this._compareLegUsedFallback
+        };
+        if (compareTestState.phase === 'slingshot') {
+            compareTestState.slingshotResults.push(result);
+        } else {
+            compareTestState.straightResults.push(result);
+        }
+    }
+
+    _advanceCompareTest() {
+        if (compareTestState.phase === 'slingshot') {
+            // Same seed, second leg (straight-line).
+            compareTestState.phase = 'straight';
+            this.replayRequested = true;
+            this.scene.restart();
+            return;
+        }
+        // Straight-line leg just finished. Roll to next seed or finish.
+        compareTestState.seedIndex++;
+        if (compareTestState.seedIndex >= compareTestState.totalSeeds) {
+            this._showCompareResults();
+            return;
+        }
+        // Fresh seed, back to slingshot leg.
+        compareTestState.phase = 'slingshot';
+        this.replayRequested = false;
+        this.worldSnapshot = null;
+        this.scene.restart();
+    }
+
+    _statsFrom(results) {
+        // successes-only mean/sd across a per-run field, matching the
+        // ensemble-test statistics helper.
+        const stats = (values) => {
+            const n = values.length;
+            if (n === 0) return { n: 0, mean: 0, sd: 0 };
+            let sum = 0;
+            for (const v of values) sum += v;
+            const mean = sum / n;
+            if (n < 2) return { n, mean, sd: 0 };
+            let sq = 0;
+            for (const v of values) sq += (v - mean) * (v - mean);
+            return { n, mean, sd: Math.sqrt(sq / (n - 1)) };
+        };
+        const successes = results.filter(r => r.success);
+        const failures  = results.filter(r => !r.success);
+        return {
+            totalCompleted: results.length,
+            successCount: successes.length,
+            failureCount: failures.length,
+            collisions: failures.filter(r => r.reason === 'COLLISION').length,
+            deadlines:  failures.filter(r => r.reason === 'DEADLINE').length,
+            fallbackCount: results.filter(r => r.fellBack).length,
+            successRate: results.length ? successes.length / results.length : 0,
+            earthTime: stats(successes.map(r => r.earthTime)),
+            shipTime:  stats(successes.map(r => r.shipTime)),
+            lostTime:  stats(successes.map(r => r.lostTime)),
+            fuelUsed:  stats(successes.map(r => r.fuelUsed))
+        };
+    }
+
+    _showCompareResults() {
+        const A = this._statsFrom(compareTestState.slingshotResults);   // slingshot cohort
+        const B = this._statsFrom(compareTestState.straightResults);    // straight cohort
+        const N = compareTestState.totalSeeds;
+        const fmt = (x) => x.toFixed(2);
+        const pct = (x) => (x * 100).toFixed(1);
+        const cell = (st) => (st.n > 0)
+            ? `${fmt(st.mean).padStart(7)} \u00b1 ${fmt(st.sd).padStart(6)}  (n=${String(st.n).padStart(2)})`
+            : `      -   \u00b1      -   (n= 0)`;
+        const row = (label, a, b) =>
+            `  ${label.padEnd(24)}${cell(a)}    ${cell(b)}`;
+
+        const lines = [];
+        lines.push(`COMPARE ENSEMBLE  ${N} seeds  (${2 * N} total trials)`);
+        lines.push('');
+        lines.push(`                          ${'SLINGSHOT'.padEnd(28)}   ${'STRAIGHT-LINE'.padEnd(28)}`);
+        lines.push(`  successes             ${(`${A.successCount}/${A.totalCompleted}  (${pct(A.successRate)}%)`).padEnd(28)}   ${(`${B.successCount}/${B.totalCompleted}  (${pct(B.successRate)}%)`).padEnd(28)}`);
+        const failLine = (s) => {
+            if (s.failureCount === 0) return '(none)';
+            const parts = [];
+            if (s.collisions > 0) parts.push(`${s.collisions} coll`);
+            if (s.deadlines  > 0) parts.push(`${s.deadlines} dead`);
+            return `${s.failureCount}  (${parts.join(', ')})`;
+        };
+        lines.push(`  failures              ${failLine(A).padEnd(28)}   ${failLine(B).padEnd(28)}`);
+        const fbLine = (s) => `${s.fallbackCount} of ${s.totalCompleted}`;
+        lines.push(`  chord-guard fallbacks ${'(n/a)'.padEnd(28)}   ${fbLine(B).padEnd(28)}`);
+        lines.push('');
+        lines.push('  Successful-run statistics (mean \u00b1 sd):');
+        lines.push(row('Earth flight time (s):', A.earthTime, B.earthTime));
+        lines.push(row('Ship  flight time (s):', A.shipTime,  B.shipTime));
+        lines.push(row('Time lost to dilation:', A.lostTime,  B.lostTime));
+        lines.push(row('Fuel used (of 100):   ', A.fuelUsed,  B.fuelUsed));
+
+        const text = this.add.text(600, 320, lines.join('\n'), {
+            fontSize: '16px',
+            fill: '#ffdd66',
+            align: 'left',
+            backgroundColor: '#000d',
+            padding: { x: 20, y: 12 },
+            fontFamily: 'monospace'
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(3000);
+
+        const makeBtn = (label, offsetX, handler) => {
+            const bg = this.add.rectangle(600 + offsetX, 620, 220, 44, 0x003344, 0.95)
+                .setScrollFactor(0).setDepth(3001)
+                .setStrokeStyle(1, 0x00ffff, 0.6)
+                .setInteractive({ useHandCursor: true });
+            const t = this.add.text(600 + offsetX, 620, label, {
+                fontSize: '18px', fill: '#0ff'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+            bg.on('pointerdown', () => { text.destroy(); bg.destroy(); t.destroy(); handler(); });
+        };
+        makeBtn('Run again (same N)', -140, () => {
+            compareTestState = {
+                totalSeeds: N,
+                seedIndex: 0,
+                phase: 'slingshot',
+                slingshotResults: [],
+                straightResults: []
+            };
+            this.replayRequested = false;
+            this.worldSnapshot = null;
+            this.scene.restart();
+        });
+        makeBtn('Back to menu', 140, () => {
+            compareTestState = null;
+            globalMode = 'MENU';
+            this.replayRequested = false;
+            this.worldSnapshot = null;
+            this.scene.restart();
+        });
+    }
+    // --------------------------------------------------------------------
 
     advanceExperimentTrial() {
         experimentConfig.runIndex++;
