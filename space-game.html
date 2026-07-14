@@ -105,6 +105,18 @@
     // burns twice as fast for the same thrust profile.
     const SHIP_DRY_MASS = 50;
     const INITIAL_FUEL_MASS = 100;
+
+    // Rolling record of recent T_plan_actual values (seconds), persisted at
+    // module scope so the pre-roll estimate survives scene restarts (retry
+    // same seed / new seed). Without this, every fresh scene resets the
+    // array and the estimate falls back to the 500 ms default forever --
+    // because refineSlingshotPlanNumerically() runs only once per scene,
+    // there's never a "second plan" within a single scene to benefit from.
+    // Kept short (last 5) so it adapts to CPU-speed / candidate-count
+    // changes but doesn't get stuck on outliers.
+    const RECENT_PLAN_TIMES_SEC = [];
+    const RECENT_PLAN_TIMES_MAX = 5;
+    const DEFAULT_PLAN_TIME_ESTIMATE_SEC = 0.5;
     const ISP_REF = 300;
     const ISP_TO_VE = 5000 / ISP_REF; // so v_e(Isp=300) = 5000
     const REFERENCE_THRUST_FORCE = 150 * (SHIP_DRY_MASS + INITIAL_FUEL_MASS); // 22500
@@ -1476,6 +1488,28 @@ class GameScene extends Phaser.Scene {
         this.minimapLabel = null;
         this.starMotionStarted = false;
 
+        // ---- Planning-latency compensation (Option B: station-keep + pre-roll) ----
+        // Wall-clock timestamp (performance.now, ms) captured at sweep-start so
+        // we can measure T_plan_actual at hand-off.
+        this._sweepStartWallMs = null;
+        // NB: the rolling average of recent T_plan_actual values lives at
+        // MODULE scope (RECENT_PLAN_TIMES_SEC) so it persists across scene
+        // restarts. See the comment near that declaration.
+        // True while the ship is being held in a gravity-cancelled state by
+        // the station-keeping controller. Consumed by applyGravity and the
+        // main update loop to skip normal physics on the ship.
+        this._stationKeepingActive = false;
+        // Fuel spent by the station-keeping controller during the current
+        // sweep (kg). Reported on the HUD at hand-off.
+        this._stationKeepingFuelSpent = 0;
+        // Cross-track error threshold (world units) beyond which the autopilot
+        // triggers an in-flight replan. Also a debounce counter so isolated
+        // spikes don't trigger a spurious replan.
+        this._replanCrossTrackThreshold = 300;
+        this._replanConsecFrames = 0;
+        this._replanConsecFramesRequired = 30;   // ~0.5 s at 60 fps
+        this._replanCooldownFrames = 0;          // frames until next replan is allowed
+
         // Plan a slingshot path only in AUTOPILOT / TEST / COMPARE modes.
         // MANUAL play has no planning phase and no autopilot.
         if (this.mode === 'AUTOPILOT' || this.mode === 'TEST' || this.mode === 'COMPARE') {
@@ -2573,65 +2607,425 @@ class GameScene extends Phaser.Scene {
         });
     }
 
-    // Chord-clearance test for the straight-line planner. Returns true iff,
-    // over the ship's expected transit along the S->E chord, every star's
-    // (moving) center stays at least (starR + shipR + margin) away from the
-    // (moving) ship center.
+    // Rolling-average estimate of how long the next sweep will take (seconds),
+    // used as the pre-roll horizon so the sweep's t=0 star state matches
+    // what will exist in the world at plan hand-off. Falls back to a fixed
+    // default before any sweeps have completed on this scene instance.
+    _getPlanTimeEstimate() {
+        if (RECENT_PLAN_TIMES_SEC.length === 0) {
+            return DEFAULT_PLAN_TIME_ESTIMATE_SEC;
+        }
+        let s = 0;
+        for (const t of RECENT_PLAN_TIMES_SEC) s += t;
+        return s / RECENT_PLAN_TIMES_SEC.length;
+    }
+
+    // Advance the given (starX, starY, starVX, starVY) arrays forward by
+    // preRollSec seconds using the same pairwise-gravity + symplectic-Euler
+    // integrator as the ship trajectory sim. Ship is NOT part of this loop
+    // (during the real sweep the ship is being station-kept, so it exerts
+    // no gravity of consequence and its own motion is trivial to predict).
+    // Mutates the arrays in place.
+    _preRollStarsInPlace(masses, starX, starY, starVX, starVY, preRollSec, dt) {
+        if (preRollSec <= 0) return;
+        const N = masses.length;
+        const starAX = new Array(N);
+        const starAY = new Array(N);
+        const steps = Math.max(1, Math.ceil(preRollSec / dt));
+        const stepDt = preRollSec / steps;
+        for (let step = 0; step < steps; step++) {
+            for (let i = 0; i < N; i++) { starAX[i] = 0; starAY[i] = 0; }
+            for (let i = 0; i < N; i++) {
+                for (let j = i + 1; j < N; j++) {
+                    const dxij = starX[j] - starX[i];
+                    const dyij = starY[j] - starY[i];
+                    const r2ij = dxij * dxij + dyij * dyij;
+                    const rij  = Math.sqrt(r2ij);
+                    if (rij > 1) {
+                        const gj = masses[j].mu / r2ij;
+                        const gi = masses[i].mu / r2ij;
+                        const ux = dxij / rij;
+                        const uy = dyij / rij;
+                        starAX[i] += ux * gj;
+                        starAY[i] += uy * gj;
+                        starAX[j] -= ux * gi;
+                        starAY[j] -= uy * gi;
+                    }
+                }
+            }
+            for (let i = 0; i < N; i++) {
+                starVX[i] += starAX[i] * stepDt;
+                starVY[i] += starAY[i] * stepDt;
+                starX[i]  += starVX[i] * stepDt;
+                starY[i]  += starVY[i] * stepDt;
+            }
+        }
+    }
+
+    // Build the per-run trajectory-simulator context used by both the
+    // straight-line fast-path check and the slingshot sweep.
     //
-    // Model:
-    //   Ship position:   P_ship(t) = S + v_ship * t,   v_ship = vCruise * uSE,
-    //                    for t in [0, T] where T = |SE| / vCruise.
-    //   Star position:   P_star(t) = (x0, y0) + (vx, vy) * t   (linear).
-    //   Relative offset: r(t) = P_star(t) - P_ship(t) = r0 + dv * t.
-    //   Analytical min of |r(t)|^2 over t in [0, T] is at
-    //       t* = clamp(-(r0 . dv) / |dv|^2, 0, T)
-    //   (or t* = 0 if |dv| = 0). Test distance at t* against the threshold.
+    // opts:
+    //   preRollSec: seconds to fast-forward the star ensemble before it
+    //     becomes the sweep's t=0 state. Set to the estimated planning
+    //     wall-time so the sweep optimizes against the world state that
+    //     will actually exist at hand-off.
+    //   useLiveShipState: if true, snapshot the player's current position
+    //     and velocity as the sim's initial ship state and pre-roll it
+    //     linearly (constant velocity, since station-keeping is cancelling
+    //     gravity during the pre-roll window). If false, the sim defaults
+    //     to (Sx, Sy) at rest as before.
     //
-    // This is a linear-motion approximation: the real ship has BOOST/BRAKE
-    // phases (slower average speed than vCruise). Slower ships give stars
-    // more time to drift into the path, so using vCruise here is optimistic.
-    // The 20-unit margin buffers this and other small modeling errors.
-    _straightLineClearsStars() {
-        if (!this.gravityObjects || this.gravityObjects.length === 0) return true;
+    // Returns null if the world doesn't yet have valid inputs.
+    _buildTrajectorySimContext(opts = {}) {
+        if (!this.gravityObjects || this.gravityObjects.length === 0) return null;
+        const preRollSec = (typeof opts.preRollSec === 'number' && opts.preRollSec > 0)
+            ? opts.preRollSec : 0;
+        const useLiveShipState = !!opts.useLiveShipState;
+
+        // Snapshot LIVE star state from Phaser bodies. Once startStarMotion
+        // has fired this is the ground-truth of "where the star cluster is
+        // right now"; before it fires (initial planning) it degenerates to
+        // the spawn state, which is fine.
+        const masses = this.gravityObjects
+            .map(o => {
+                const bv = (o.body && o.body.velocity) ? o.body.velocity : { x: 0, y: 0 };
+                return {
+                    obj: o,
+                    mu: o.getData('gravityStrength'),
+                    x0: o.x,
+                    y0: o.y,
+                    vx: bv.x || 0,
+                    vy: bv.y || 0,
+                    killR: (typeof o.getData('killRadius') === 'number') ? o.getData('killRadius') : 0
+                };
+            })
+            .filter(m => typeof m.mu === 'number' && m.mu > 0);
+        if (masses.length === 0) return null;
+
         const Sx = this.startX, Sy = this.startY;
         const Ex = this.earthX, Ey = this.earthY;
         const dxSE = Ex - Sx, dySE = Ey - Sy;
         const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
-        if (lenSE < 1e-6) return true;
-        const uSEx = dxSE / lenSE, uSEy = dySE / lenSE;
+        if (lenSE < 1e-3) return null;
+        const uxBase = dxSE / lenSE, uyBase = dySE / lenSE;
+
         const vCruise = (activeTuningParams && activeTuningParams.vCruise) || 250;
-        const vShipX = vCruise * uSEx, vShipY = vCruise * uSEy;
-        const T = lenSE / vCruise;               // expected transit time
+        if (vCruise <= 0) return null;
+
+        const dt          = 0.04;
+        const maxTime     = 2 * lenSE / vCruise;
+        const maxSteps    = Math.floor(maxTime / dt);
+        const thrustForce = currentMainThrustForce();
+        const exhaustVel  = currentExhaustVelocity();
+
+        // Snapshot / pre-roll ship state. Under station-keeping the ship
+        // coasts in a gravity-cancelled frame, so its motion during the
+        // pre-roll window is exactly (pos + vel * dt), i.e. a straight line.
+        let initShipX = Sx, initShipY = Sy, initShipVX = 0, initShipVY = 0;
+        if (useLiveShipState && this.player && this.player.body) {
+            initShipX = this.player.x;
+            initShipY = this.player.y;
+            initShipVX = this.player.body.velocity.x || 0;
+            initShipVY = this.player.body.velocity.y || 0;
+        }
+
+        // Pre-roll stars in place under full mutual gravity.
+        if (preRollSec > 0) {
+            const N = masses.length;
+            const starX = new Array(N), starY = new Array(N);
+            const starVX = new Array(N), starVY = new Array(N);
+            for (let i = 0; i < N; i++) {
+                starX[i] = masses[i].x0;   starY[i] = masses[i].y0;
+                starVX[i] = masses[i].vx;  starVY[i] = masses[i].vy;
+            }
+            this._preRollStarsInPlace(masses, starX, starY, starVX, starVY, preRollSec, dt);
+            for (let i = 0; i < N; i++) {
+                masses[i].x0 = starX[i];   masses[i].y0 = starY[i];
+                masses[i].vx = starVX[i];  masses[i].vy = starVY[i];
+            }
+            // Pre-roll ship linearly (station-keeping = zero net force).
+            initShipX += initShipVX * preRollSec;
+            initShipY += initShipVY * preRollSec;
+        }
+
+        return {
+            Sx, Sy, Ex, Ey,
+            dxSE, dySE, lenSE,
+            uxBase, uyBase,
+            vCruise,
+            vCruise2: vCruise * vCruise,
+            masses,
+            earthRadius: 80 * 5,        // matches createEarth
+            dt, maxSteps, maxTime,
+            thrustForce,
+            fuelBurnRate: thrustForce / exhaustVel,
+            initialFuel: INITIAL_FUEL_MASS,
+            dryMass: SHIP_DRY_MASS,
+            initShip: { x: initShipX, y: initShipY, vx: initShipVX, vy: initShipVY },
+            preRollSec
+        };
+    }
+
+    // Full N-body ship-trajectory simulator. Departs from S at rest, thrusts
+    // along (uxBase, uyBase) rotated by angleOffset until reaching vCruise
+    // or exhausting fuel, then coasts. Every step:
+    //   (a) accumulates star-on-ship gravity + tracks closest approach,
+    //   (b) accumulates pairwise star-on-star gravity (full N-body),
+    //   (c) symplectic-Euler integrates ship and all stars,
+    //   (d) checks for Earth arrival, S-E baseline re-crossing, or BH kill.
+    // Returns the same result shape used by the slingshot sweep so both
+    // callers can consume it uniformly.
+    _simulateShipTrajectoryNBody(angleOffset, ctx) {
+        const {
+            Sx, Sy, Ex, Ey,
+            dxSE, dySE,
+            uxBase, uyBase,
+            vCruise, vCruise2,
+            masses,
+            earthRadius,
+            dt, maxSteps, maxTime,
+            thrustForce, fuelBurnRate, initialFuel, dryMass
+        } = ctx;
+
+        // Initial ship state defaults to rest-at-S but callers can override
+        // via ctx.initShip = { x, y, vx, vy } to plan from an arbitrary
+        // launch state (used by the pre-rolled sweep and by in-flight
+        // replanning where the ship is already coasting at cruise speed).
+        const init = ctx.initShip || { x: Sx, y: Sy, vx: 0, vy: 0 };
+        let x = init.x;
+        let y = init.y;
+        const cosA = Math.cos(angleOffset);
+        const sinA = Math.sin(angleOffset);
+        const dirX = uxBase * cosA - uyBase * sinA;
+        const dirY = uxBase * sinA + uyBase * cosA;
+        let vx = init.vx;
+        let vy = init.vy;
+        let fuel = initialFuel;
+        // If the initial velocity is already at or past cruise, skip BOOST
+        // entirely and go straight to ballistic coast -- avoids over-burning
+        // fuel when the sim is invoked as a replanning refinement on a ship
+        // that's already at speed.
+        let boosting = (vx * vx + vy * vy) < vCruise2;
+
+        const N = masses.length;
+        const starX  = new Array(N);
+        const starY  = new Array(N);
+        const starVX = new Array(N);
+        const starVY = new Array(N);
+        const starAX = new Array(N);
+        const starAY = new Array(N);
+        for (let i = 0; i < N; i++) {
+            starX[i]  = masses[i].x0;
+            starY[i]  = masses[i].y0;
+            starVX[i] = masses[i].vx;
+            starVY[i] = masses[i].vy;
+        }
+
+        const baselineSign = (px, py) => (px - Sx) * dySE - (py - Sy) * dxSE;
+
+        let t = 0;
+        let minDist2 = Number.POSITIVE_INFINITY;
+        let periX = x;
+        let periY = y;
+        let periIndex = 0;
+        let closestObj = null;
+
+        let prevSign = baselineSign(x, y);
+        let crossings = 0;
+        let bestCrossX = null;
+        let bestCrossY = null;
+        let bestCrossT = null;
+        let bestDistToEarth = Number.POSITIVE_INFINITY;
+        let stopT = null;
+
+        const recordEvery = 5;
+        const trajectoryPoints = [{ x, y }];
+
+        for (let step = 0; step < maxSteps; step++) {
+            let ax = 0;
+            let ay = 0;
+            let killed = false;
+
+            if (boosting) {
+                const mass = dryMass + fuel;
+                const Fx = dirX * thrustForce;
+                const Fy = dirY * thrustForce;
+                const aRel = relativisticThrustAccel(Fx, Fy, mass, vx, vy);
+                ax += aRel.ax;
+                ay += aRel.ay;
+                fuel -= fuelBurnRate * dt;
+                if (fuel <= 0) { fuel = 0; boosting = false; }
+            }
+
+            for (let i = 0; i < N; i++) {
+                const dxCS = starX[i] - x;
+                const dyCS = starY[i] - y;
+                const r2 = dxCS * dxCS + dyCS * dyCS;
+                const r = Math.sqrt(r2);
+                if (r > 1) {
+                    const g = masses[i].mu / r2;
+                    ax += (dxCS / r) * g;
+                    ay += (dyCS / r) * g;
+                }
+                if (r2 < minDist2) {
+                    minDist2 = r2;
+                    periX = x;
+                    periY = y;
+                    periIndex = trajectoryPoints.length - 1;
+                    closestObj = masses[i].obj;
+                }
+                if (masses[i].killR > 0 && r <= masses[i].killR) {
+                    killed = true;
+                }
+            }
+            if (killed) {
+                trajectoryPoints.push({ x, y });
+                return {
+                    hit: false,
+                    miss: true,
+                    trajectoryPoints,
+                    periX, periY, periIndex,
+                    minDistToStar: Math.sqrt(minDist2),
+                    closestObj,
+                    killedByBlackHole: true
+                };
+            }
+
+            for (let i = 0; i < N; i++) { starAX[i] = 0; starAY[i] = 0; }
+            for (let i = 0; i < N; i++) {
+                for (let j = i + 1; j < N; j++) {
+                    const dxij = starX[j] - starX[i];
+                    const dyij = starY[j] - starY[i];
+                    const r2ij = dxij * dxij + dyij * dyij;
+                    const rij  = Math.sqrt(r2ij);
+                    if (rij > 1) {
+                        const gj = masses[j].mu / r2ij;
+                        const gi = masses[i].mu / r2ij;
+                        const ux = dxij / rij;
+                        const uy = dyij / rij;
+                        starAX[i] += ux * gj;
+                        starAY[i] += uy * gj;
+                        starAX[j] -= ux * gi;
+                        starAY[j] -= uy * gi;
+                    }
+                }
+            }
+
+            vx += ax * dt;
+            vy += ay * dt;
+            if (boosting && (vx * vx + vy * vy) >= vCruise2) {
+                boosting = false;
+            }
+            for (let i = 0; i < N; i++) {
+                starVX[i] += starAX[i] * dt;
+                starVY[i] += starAY[i] * dt;
+                starX[i]  += starVX[i] * dt;
+                starY[i]  += starVY[i] * dt;
+            }
+
+            x += vx * dt;
+            y += vy * dt;
+            t += dt;
+
+            if ((step + 1) % recordEvery === 0) {
+                trajectoryPoints.push({ x, y });
+            }
+
+            const dxE = x - Ex;
+            const dyE = y - Ey;
+            const distE = Math.sqrt(dxE * dxE + dyE * dyE);
+            if (distE <= earthRadius) {
+                trajectoryPoints.push({ x, y });
+                return {
+                    hit: true,
+                    miss: false,
+                    crossX: x, crossY: y, crossTime: t,
+                    distToEarth: distE,
+                    periX, periY, periIndex,
+                    trajectoryPoints,
+                    minDistToStar: Math.sqrt(minDist2),
+                    closestObj
+                };
+            }
+
+            const s = baselineSign(x, y);
+            if (t > dt * 2 && prevSign !== 0 && s !== 0 && Math.sign(s) !== Math.sign(prevSign)) {
+                crossings++;
+                if (distE < bestDistToEarth) {
+                    bestDistToEarth = distE;
+                    bestCrossX = x;
+                    bestCrossY = y;
+                    bestCrossT = t;
+                }
+                if (crossings === 1 && stopT === null) {
+                    const coastDist = 2000;
+                    const coastByTime = 0.4 * maxTime;
+                    const coastByDist = coastDist / Math.max(1, vCruise);
+                    stopT = t + Math.max(coastByTime, coastByDist);
+                }
+            }
+            prevSign = s;
+
+            if (stopT !== null && t >= stopT) break;
+        }
+
+        if (bestCrossX !== null) {
+            trajectoryPoints.push({ x, y });
+            return {
+                hit: false,
+                miss: false,
+                crossX: bestCrossX, crossY: bestCrossY, crossTime: bestCrossT,
+                distToEarth: bestDistToEarth,
+                periX, periY, periIndex,
+                trajectoryPoints,
+                minDistToStar: Math.sqrt(minDist2),
+                closestObj
+            };
+        }
+
+        trajectoryPoints.push({ x, y });
+        return {
+            hit: false,
+            miss: true,
+            trajectoryPoints,
+            periX, periY, periIndex,
+            minDistToStar: Math.sqrt(minDist2),
+            closestObj
+        };
+    }
+
+    // Fast-path chord-clearance test for the straight-line planner. Runs the
+    // full N-body integrator (same physics as the slingshot sweep) with the
+    // ship departing straight along the S->E baseline (angleOffset = 0).
+    // Returns true iff:
+    //   (a) the simulated ship actually reaches Earth (result.hit === true),
+    //   (b) the ship never comes within (starR + shipR + margin) of any
+    //       star's evolving center over the whole trajectory.
+    // This drops both of the previous approximations (constant-vCruise ship
+    // motion and linear star motion) in favor of the same simulation the
+    // slingshot sweep uses on every candidate, so the fast-path verdict is
+    // consistent with what the sweep would find for the same heading.
+    _straightLineClearsStars() {
+        const ctx = this._buildTrajectorySimContext();
+        if (!ctx) return true;  // no massive objects to worry about
+
+        const result = this._simulateShipTrajectoryNBody(0, ctx);
+        if (!result || result.miss || !result.hit) return false;
+
+        // Minimum-clearance filter. minDistToStar is center-to-center; every
+        // mass in ctx.masses has a Phaser radius on its .obj. Use the max
+        // radius across the ensemble as a conservative "starR" bound so a
+        // single scalar threshold covers stars and BHs alike.
         const shipR = 15;
         const margin = 20;
-
-        for (const obj of this.gravityObjects) {
-            const x0  = (typeof obj.getData('x0')  === 'number') ? obj.getData('x0')  : obj.x;
-            const y0  = (typeof obj.getData('y0')  === 'number') ? obj.getData('y0')  : obj.y;
-            const svx = (typeof obj.getData('vx')  === 'number') ? obj.getData('vx')  : 0;
-            const svy = (typeof obj.getData('vy')  === 'number') ? obj.getData('vy')  : 0;
-            const starR = obj.radius || 0;
-            const threshold = starR + shipR + margin;
-
-            // r(t) = r0 + dv * t
-            const r0x = x0 - Sx,      r0y = y0 - Sy;
-            const dvx = svx - vShipX, dvy = svy - vShipY;
-            const dv2 = dvx * dvx + dvy * dvy;
-
-            let tStar;
-            if (dv2 < 1e-9) {
-                tStar = 0;                       // no relative motion
-            } else {
-                tStar = -(r0x * dvx + r0y * dvy) / dv2;
-                if (tStar < 0) tStar = 0;
-                else if (tStar > T) tStar = T;
-            }
-            const rx = r0x + dvx * tStar;
-            const ry = r0y + dvy * tStar;
-            const dist = Math.sqrt(rx * rx + ry * ry);
-            if (dist < threshold) return false;
+        let maxObjRadius = 0;
+        for (const m of ctx.masses) {
+            const r = (m.obj && typeof m.obj.radius === 'number') ? m.obj.radius : 0;
+            if (r > maxObjRadius) maxObjRadius = r;
         }
-        return true;
+        const threshold = maxObjRadius + shipR + margin;
+        return result.minDistToStar >= threshold;
     }
 
     // Build a synthetic straight-line "slingshot plan" so the compare-test
@@ -2722,55 +3116,44 @@ class GameScene extends Phaser.Scene {
             return;
         }
 
-        // Build a list of massive objects with valid gravity strengths.
-        // Each entry snapshots the mass's kinematic state at t=0 so the
-        // sweep integrator can compute its position at sim time t as
-        // (x0 + vx*t, y0 + vy*t). Static masses have vx = vy = 0.
-        const masses = this.gravityObjects
-            .map(o => ({
-                obj: o,
-                mu: o.getData('gravityStrength'),
-                x0: (typeof o.getData('x0') === 'number') ? o.getData('x0') : o.x,
-                y0: (typeof o.getData('y0') === 'number') ? o.getData('y0') : o.y,
-                vx: (typeof o.getData('vx') === 'number') ? o.getData('vx') : 0,
-                vy: (typeof o.getData('vy') === 'number') ? o.getData('vy') : 0,
-                // Fatal contact radius (event horizon for black holes; 0 for
-                // regular stars, which are handled by the separate sunRadius
-                // clip filter downstream).
-                killR: (typeof o.getData('killRadius') === 'number') ? o.getData('killRadius') : 0
-            }))
-            .filter(m => typeof m.mu === 'number' && m.mu > 0);
-        if (masses.length === 0) {
-            return;
-        }
+        // Start the world clock (star motion + evolution) at sweep-start so
+        // stars are actively drifting under mutual gravity for the whole
+        // planning window. Combined with the station-keeping block below,
+        // this makes the "ship computing while stars move" model literal.
+        this.startStarMotion();
 
-        const Sx = this.startX;
-        const Sy = this.startY;
-        const Ex = this.earthX;
-        const Ey = this.earthY;
+        // Engage station-keeping on the ship: it stays in its current
+        // (position, velocity) state during the sweep by cancelling
+        // gravitational forces. See applyGravity + update() for the actual
+        // freeze; here we just flip the flag and reset the fuel accumulator.
+        this._stationKeepingActive = true;
+        this._stationKeepingFuelSpent = 0;
+        // Snapshot the sweep-start wall-clock so we can measure how long
+        // planning actually took at hand-off.
+        this._sweepStartWallMs = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now()
+            : Date.now();
 
-        // Preserve the original green S->E baseline for crossing detection and
-        // as the reference direction for the sweep.
-        const dxSE = Ex - Sx;
-        const dySE = Ey - Sy;
-        const lenSE = Math.sqrt(dxSE * dxSE + dySE * dySE);
-        if (lenSE < 1e-3) {
-            return;
-        }
-
-        const uxBase = dxSE / lenSE;
-        const uyBase = dySE / lenSE;
-
-        const vCruise = activeTuningParams.vCruise;
-        if (typeof vCruise !== 'number' || vCruise <= 0) {
-            return;
-        }
-
-        // Simulation time per candidate: enough for a trajectory travelling
-        // at vCruise to traverse the S->E distance twice (once outbound past
-        // the star, once inbound back toward Earth), which is comfortably
-        // more than needed for any candidate whose deflection stays modest.
-        const maxTime = 2 * lenSE / vCruise;
+        // Pre-roll the star ensemble by the estimated wall-clock planning
+        // time so the sweep's t=0 state matches the world's actual state at
+        // hand-off. useLiveShipState=true so if we're replanning mid-flight
+        // the ship's current (position, velocity) becomes the sim's initial
+        // condition. On the very first plan the ship is at rest at S and
+        // this degenerates to the previous (Sx, Sy, 0, 0) initial state.
+        this._lastPlanTimeEstimateSec = this._getPlanTimeEstimate();
+        const ctx = this._buildTrajectorySimContext({
+            preRollSec: this._lastPlanTimeEstimateSec,
+            useLiveShipState: true
+        });
+        if (!ctx) return;
+        const {
+            Sx, Sy, Ex, Ey,
+            dxSE, dySE, lenSE,
+            uxBase, uyBase,
+            vCruise,
+            masses,
+            maxTime
+        } = ctx;
 
         // Adaptive angle sweep. Instead of a fixed +/- range we expand
         // outward from 0 in each direction until the simulated trajectory
@@ -2835,7 +3218,11 @@ class GameScene extends Phaser.Scene {
             earthRadius: 80 * 5,
             lineHitThreshold: 0.5 * (80 * 5),
             dt: 0.04,
-            maxTime
+            maxTime,
+            // Full pre-rolled ctx: updateSlingshotSweep hands this directly
+            // to _simulateShipTrajectoryNBody so every candidate is scored
+            // against the star state that will exist at hand-off.
+            simCtx: ctx
         };
 
         // Only one graphics layer during the sweep: the "current" line
@@ -2996,273 +3383,20 @@ class GameScene extends Phaser.Scene {
         const dryMass       = SHIP_DRY_MASS;
         const vCruise2      = vCruise * vCruise;   // squared-speed threshold
 
-        // Helper to simulate a single trajectory for a given heading angle.
-        // Model: BOOST phase (constant thrust along the departure direction,
-        // fuel-mass drain) until |v| >= vCruise or fuel = 0, then ballistic
-        // coasting under full N-body star gravity. This closes the "planned
-        // vs actual" trajectory gap that arose from the previous model's
-        // instantaneous launch at cruise speed with fixed mass.
-        const simulateForAngle = (angleOffset) => {
-            let x = Sx;
-            let y = Sy;
-            const cosA = Math.cos(angleOffset);
-            const sinA = Math.sin(angleOffset);
-            // Departure unit direction (was previously used only to seed the
-            // initial velocity). Also the direction of thrust during BOOST.
-            const dirX = uxBase * cosA - uyBase * sinA;
-            const dirY = uxBase * sinA + uyBase * cosA;
-            // Ship starts at rest -- BOOST accelerates it to vCruise.
-            let vx = 0;
-            let vy = 0;
-            // Fuel / mass state. Live gameplay drains fuel from
-            // INITIAL_FUEL_MASS with the same rate as here.
-            let fuel = initialFuel;
-            let boosting = true;
-
-            // Per-trial mutable star state. Each trial starts the stars back
-            // at their t=0 initial conditions and evolves them under mutual
-            // gravity alongside the rocket.
-            const N = masses.length;
-            const starX  = new Array(N);
-            const starY  = new Array(N);
-            const starVX = new Array(N);
-            const starVY = new Array(N);
-            const starAX = new Array(N);
-            const starAY = new Array(N);
-            for (let i = 0; i < N; i++) {
-                starX[i]  = masses[i].x0;
-                starY[i]  = masses[i].y0;
-                starVX[i] = masses[i].vx;
-                starVY[i] = masses[i].vy;
-            }
-
-            // Crossing detection remains relative to the original green S->E
-            // baseline so we can measure distance to Earth where the trajectory
-            // re-crosses that line.
-            const baselineSign = (px, py) => (px - Sx) * dySE - (py - Sy) * dxSE;
-
-            let t = 0;
-            let minDist2 = Number.POSITIVE_INFINITY;
-            let periX = x;
-            let periY = y;
-            let periIndex = 0;
-            let closestObj = null;
-
-            let prevSign = baselineSign(x, y);
-            let crossings = 0;
-            let bestCrossX = null;
-            let bestCrossY = null;
-            let bestCrossT = null;
-            let bestDistToEarth = Number.POSITIVE_INFINITY;
-            // Time at which to stop the integration. Latched on the first
-            // baseline crossing so the trajectory can coast past the Earth-
-            // interception region. Null until then.
-            let stopT = null;
-
-            // Downsampled trajectory polyline. Every recordEvery integration
-            // steps we push a waypoint; the controller and visualization later
-            // treat this polyline as the actual reference path (not the straight
-            // S->T->E chord). Storing every 5th step of a 500-step sim gives
-            // ~100 waypoints, cheap in memory and smooth enough to follow.
-            const recordEvery = 5;
-            const trajectoryPoints = [{ x: Sx, y: Sy }];
-
-            for (let step = 0; step < maxSteps; step++) {
-                // 1) Accumulate rocket acceleration + track closest-approach
-                //    using current star positions.
-                let ax = 0;
-                let ay = 0;
-                let killed = false;
-
-                // 1a) BOOST-phase thrust along the departure direction. Ends
-                //     when the ship reaches cruise speed or runs out of fuel.
-                //     Uses relativistic F = dp/dt so the ship asymptotes to c
-                //     instead of exceeding it, matching the live-flight model.
-                if (boosting) {
-                    const mass = dryMass + fuel;
-                    const Fx = dirX * thrustForce;
-                    const Fy = dirY * thrustForce;
-                    const aRel = relativisticThrustAccel(Fx, Fy, mass, vx, vy);
-                    ax += aRel.ax;
-                    ay += aRel.ay;
-                    // Burn fuel this step (clamped so we never go negative).
-                    fuel -= fuelBurnRate * dt;
-                    if (fuel <= 0) { fuel = 0; boosting = false; }
-                }
-
-                for (let i = 0; i < N; i++) {
-                    const dxCS = starX[i] - x;
-                    const dyCS = starY[i] - y;
-                    const r2 = dxCS * dxCS + dyCS * dyCS;
-                    const r = Math.sqrt(r2);
-                    if (r > 1) {
-                        const g = masses[i].mu / r2;
-                        ax += (dxCS / r) * g;
-                        ay += (dyCS / r) * g;
-                    }
-                    if (r2 < minDist2) {
-                        minDist2 = r2;
-                        periX = x;
-                        periY = y;
-                        periIndex = trajectoryPoints.length - 1;
-                        closestObj = masses[i].obj;
-                    }
-                    // Fatal contact: trajectories that reach within any mass's
-                    // event horizon are unrecoverable. Reject as miss so the
-                    // planner never selects them.
-                    if (masses[i].killR > 0 && r <= masses[i].killR) {
-                        killed = true;
-                    }
-                }
-                if (killed) {
-                    trajectoryPoints.push({ x, y });
-                    return {
-                        hit: false,
-                        miss: true,
-                        trajectoryPoints,
-                        periX,
-                        periY,
-                        periIndex,
-                        minDistToStar: Math.sqrt(minDist2),
-                        closestObj,
-                        killedByBlackHole: true
-                    };
-                }
-
-                // 2) Accumulate pairwise star-on-star accelerations at the
-                //    current time step. Each star's mu is the gravitational
-                //    parameter (G*M) that ANOTHER body would feel from it, so
-                //    star i's acceleration from star j uses masses[j].mu.
-                for (let i = 0; i < N; i++) { starAX[i] = 0; starAY[i] = 0; }
-                for (let i = 0; i < N; i++) {
-                    for (let j = i + 1; j < N; j++) {
-                        const dxij = starX[j] - starX[i];
-                        const dyij = starY[j] - starY[i];
-                        const r2ij = dxij * dxij + dyij * dyij;
-                        const rij  = Math.sqrt(r2ij);
-                        if (rij > 1) {
-                            const gj = masses[j].mu / r2ij; // accel on i from j
-                            const gi = masses[i].mu / r2ij; // accel on j from i
-                            const ux = dxij / rij;
-                            const uy = dyij / rij;
-                            starAX[i] += ux * gj;
-                            starAY[i] += uy * gj;
-                            starAX[j] -= ux * gi;
-                            starAY[j] -= uy * gi;
-                        }
-                    }
-                }
-
-                // 3) Symplectic-Euler update: velocities first, then positions.
-                vx += ax * dt;
-                vy += ay * dt;
-                if (boosting && (vx * vx + vy * vy) >= vCruise2) {
-                    boosting = false;   // reached cruise speed; cut thrust
-                }
-                for (let i = 0; i < N; i++) {
-                    starVX[i] += starAX[i] * dt;
-                    starVY[i] += starAY[i] * dt;
-                    starX[i]  += starVX[i] * dt;
-                    starY[i]  += starVY[i] * dt;
-                }
-
-                x += vx * dt;
-                y += vy * dt;
-                t += dt;
-
-                if ((step + 1) % recordEvery === 0) {
-                    trajectoryPoints.push({ x, y });
-                }
-
-                const dxE = x - Ex;
-                const dyE = y - Ey;
-                const distE = Math.sqrt(dxE * dxE + dyE * dyE);
-                if (distE <= earthRadius) {
-                    // Ensure the final impact point is captured.
-                    trajectoryPoints.push({ x, y });
-                    return {
-                        hit: true,
-                        miss: false,
-                        crossX: x,
-                        crossY: y,
-                        crossTime: t,
-                        distToEarth: distE,
-                        periX,
-                        periY,
-                        periIndex,
-                        trajectoryPoints,
-                        minDistToStar: Math.sqrt(minDist2),
-                        closestObj
-                    };
-                }
-
-                const s = baselineSign(x, y);
-                if (t > dt * 2 && prevSign !== 0 && s !== 0 && Math.sign(s) !== Math.sign(prevSign)) {
-                    crossings++;
-                    const crossX = x;
-                    const crossY = y;
-                    const dCrossE = distE;
-                    if (dCrossE < bestDistToEarth) {
-                        bestDistToEarth = dCrossE;
-                        bestCrossX = crossX;
-                        bestCrossY = crossY;
-                        bestCrossT = t;
-                    }
-
-                    // On the first baseline crossing, latch a stop time that
-                    // lets the trajectory coast well past the crossing so the
-                    // recorded polyline extends beyond the Earth-interception
-                    // region rather than truncating right at it. Coast window
-                    // = max(40% of maxTime, ~2000 px at cruise speed).
-                    if (crossings === 1 && stopT === null) {
-                        const coastDist = 2000;
-                        const coastByTime = 0.4 * maxTime;
-                        const coastByDist = coastDist / Math.max(1, vCruise);
-                        stopT = t + Math.max(coastByTime, coastByDist);
-                    }
-                }
-                prevSign = s;
-
-                if (stopT !== null && t >= stopT) {
-                    break;
-                }
-            }
-
-            if (bestCrossX !== null) {
-                // Ensure the last integrated point is in the polyline.
-                trajectoryPoints.push({ x, y });
-                return {
-                    hit: false,
-                    miss: false,
-                    crossX: bestCrossX,
-                    crossY: bestCrossY,
-                    crossTime: bestCrossT,
-                    distToEarth: bestDistToEarth,
-                    periX,
-                    periY,
-                    periIndex,
-                    trajectoryPoints,
-                    minDistToStar: Math.sqrt(minDist2),
-                    closestObj
-                };
-            }
-
-            // Even for "miss" candidates (never re-crossed the S->E baseline),
-            // return the trajectory polyline so the sweep visualization can
-            // still draw them. Scoring code in the caller keys off miss=true
-            // and ignores these for best-so-far selection.
-            trajectoryPoints.push({ x, y });
-            return {
-                hit: false,
-                miss: true,
-                trajectoryPoints,
-                periX,
-                periY,
-                periIndex,
-                minDistToStar: Math.sqrt(minDist2),
-                closestObj
-            };
+        // Use the pre-rolled ctx captured at sweep-start (with estimated
+        // planning-latency compensation already baked into the star state).
+        // Falls back to a fresh no-pre-roll ctx if for any reason the stored
+        // one isn't present (defensive; shouldn't occur in normal flow).
+        const simCtx = data.simCtx || {
+            Sx, Sy, Ex, Ey, dxSE, dySE, uxBase, uyBase,
+            vCruise, vCruise2,
+            masses, earthRadius,
+            dt, maxSteps, maxTime,
+            thrustForce, fuelBurnRate, initialFuel, dryMass,
+            initShip: { x: Sx, y: Sy, vx: 0, vy: 0 }
         };
+        const simulateForAngle = (angleOffset) =>
+            this._simulateShipTrajectoryNBody(angleOffset, simCtx);
 
         // Convergence tolerance: 10% of Earth's radius, measured as
         // Euclidean distance from the trajectory's S->E baseline crossing
@@ -3454,6 +3588,11 @@ class GameScene extends Phaser.Scene {
                 }
 
                 this.slingshotSweepFailed = true;
+                // Sweep failed: release station-keeping so the ship falls
+                // under gravity as expected (no plan to fly, no reason to
+                // keep burning fuel holding position).
+                this._stationKeepingActive = false;
+                this._sweepStartWallMs = null;
 
                 const cam = this.cameras.main;
                 const cx = cam.width / 2;
@@ -3483,8 +3622,47 @@ class GameScene extends Phaser.Scene {
                 return;
             }
 
-            const bestResult = chosen.result;
+            let bestResult = chosen.result;
             const bestAngle = chosen.angle;
+
+            // ---- Hand-off reconciliation ----
+            // The sweep's bestResult was computed against pre-rolled star
+            // state (estimated for wall-time T_plan_est). Reality is that
+            // stars have actually evolved for T_plan_actual seconds. Refit
+            // the winning trajectory against the world's current state so
+            // the polyline the autopilot will fly matches what actually
+            // happens when it starts flying it. This is one extra sim call
+            // (~0.5 ms) but eliminates the "plan/reality mismatch" gap.
+            const liveCtx = this._buildTrajectorySimContext({
+                preRollSec: 0,
+                useLiveShipState: true
+            });
+            if (liveCtx) {
+                const liveResult = this._simulateShipTrajectoryNBody(bestAngle, liveCtx);
+                if (liveResult && !liveResult.miss && liveResult.trajectoryPoints
+                    && liveResult.trajectoryPoints.length >= 2) {
+                    bestResult = liveResult;
+                }
+            }
+
+            // Release station-keeping: applyGravity resumes normal physics
+            // on the ship on the next frame, and BOOST engages via the
+            // autopilot enable-gate immediately after this function returns.
+            this._stationKeepingActive = false;
+
+            // Record planning wall-time for the rolling pre-roll estimate.
+            if (this._sweepStartWallMs !== null) {
+                const nowMs = (typeof performance !== 'undefined' && performance.now)
+                    ? performance.now()
+                    : Date.now();
+                const tPlan = (nowMs - this._sweepStartWallMs) / 1000;
+                RECENT_PLAN_TIMES_SEC.push(tPlan);
+                while (RECENT_PLAN_TIMES_SEC.length > RECENT_PLAN_TIMES_MAX) {
+                    RECENT_PLAN_TIMES_SEC.shift();
+                }
+                this._lastPlanTimeSec = tPlan;   // for HUD
+                this._sweepStartWallMs = null;
+            }
             const accepted = bestResult.distToEarth <= lineHitThreshold;
             const winnerSide = (chosen.angle >= 0) ? '+' : '-';
             const fineImproved = (this.slingshotSweepFineBest && coneWinner &&
@@ -3563,6 +3741,22 @@ class GameScene extends Phaser.Scene {
             // refineSlingshotPlanNumerically(); the per-frame
             // drawSlingshotDebug() call will pick up the new plan and
             // render the red trajectory automatically.
+
+            // Planning-latency HUD banner: shows how long computing the
+            // plan actually took and how much fuel station-keeping burned
+            // to hold the ship in place during that window.
+            if (this.mode === 'AUTOPILOT' && typeof this._showPlannerBanner === 'function') {
+                const tPlan = (typeof this._lastPlanTimeSec === 'number')
+                    ? this._lastPlanTimeSec.toFixed(2) : '?';
+                const tEst = (typeof this._lastPlanTimeEstimateSec === 'number')
+                    ? this._lastPlanTimeEstimateSec.toFixed(2) : '?';
+                const fuelHeld = (typeof this._stationKeepingFuelSpent === 'number')
+                    ? this._stationKeepingFuelSpent.toFixed(2) : '?';
+                this._showPlannerBanner(
+                    `Plan ready in ${tPlan} s (est ${tEst} s) -- station-keeping fuel: ${fuelHeld} kg`,
+                    '#66ccff'
+                );
+            }
         }
     }
 
@@ -4834,27 +5028,23 @@ class GameScene extends Phaser.Scene {
     }
 
     applyGravity(delta) {
+        const dtSec = delta / 1000;
+
+        // Accumulate the total gravitational acceleration the ship WOULD
+        // feel this frame. We tally it into (axTot, ayTot) either to apply
+        // it (normal flight) or to fuel-cost it (station-keeping active).
+        let axTot = 0, ayTot = 0;
+
         // Gravity from stars / black holes
         this.gravityObjects.forEach(obj => {
             const dx = obj.x - this.player.x;
             const dy = obj.y - this.player.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
-            
             if (dist > 1) {
                 const gravityStrength = obj.getData('gravityStrength');
-                const schwarzschildRadius = obj.getData('schwarzschildRadius');
-                
-                let force = gravityStrength / (dist * dist);
-                
-                // Increase force dramatically when close
-                if (dist < schwarzschildRadius) {
-                }
-                
-                const forceX = (dx / dist) * force;
-                const forceY = (dy / dist) * force;
-                
-                this.player.body.velocity.x += forceX * (delta / 1000);
-                this.player.body.velocity.y += forceY * (delta / 1000);
+                const force = gravityStrength / (dist * dist);
+                axTot += (dx / dist) * force;
+                ayTot += (dy / dist) * force;
             }
         });
 
@@ -4869,12 +5059,43 @@ class GameScene extends Phaser.Scene {
                 // star.
                 const earthGravityStrength = 40000 * 5;
                 const gE = earthGravityStrength / (distE * distE);
-                const fxE = (dxE / distE) * gE;
-                const fyE = (dyE / distE) * gE;
-                this.player.body.velocity.x += fxE * (delta / 1000);
-                this.player.body.velocity.y += fyE * (delta / 1000);
+                axTot += (dxE / distE) * gE;
+                ayTot += (dyE / distE) * gE;
             }
         }
+
+        if (this._stationKeepingActive) {
+            // Station-keeping = gravity-cancellation. We thrust opposite the
+            // net gravitational acceleration with just enough force to zero
+            // it out; ship velocity is not touched (it coasts inertially in
+            // the resulting force-free frame). Fuel is drawn at the ideal
+            // rocket-equation rate for that equivalent thrust:
+            //   F = m * a_grav ;   m_dot = F / v_exhaust
+            const gMag = Math.sqrt(axTot * axTot + ayTot * ayTot);
+            if (gMag > 0 && this.fuel > 0) {
+                const mass = currentShipMass(this);
+                const F = mass * gMag;
+                const ve = currentExhaustVelocity();
+                const burn = (F / ve) * dtSec;
+                const actual = Math.min(burn, this.fuel);
+                this.fuel -= actual;
+                this._stationKeepingFuelSpent += actual;
+                if (this.fuel <= 0) {
+                    // Out of fuel: station-keeping fails. Fall through to
+                    // normal gravity so the ship starts falling and the
+                    // player sees the consequence. Also flip the flag so
+                    // subsequent frames stop trying to cancel gravity.
+                    this._stationKeepingActive = false;
+                    this.player.body.velocity.x += axTot * dtSec;
+                    this.player.body.velocity.y += ayTot * dtSec;
+                }
+            }
+            return;
+        }
+
+        // Normal flight: apply the accumulated gravitational acceleration.
+        this.player.body.velocity.x += axTot * dtSec;
+        this.player.body.velocity.y += ayTot * dtSec;
     }
 
     updateTime(delta) {
