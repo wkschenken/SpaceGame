@@ -3104,6 +3104,11 @@ class GameScene extends Phaser.Scene {
                 this.slingshotPlan = this._buildStraightLinePlan();
                 this.slingshotSweepActive = false;
                 this.slingshotSweepFailed = false;
+                // If a prior failed sweep left station-keeping engaged
+                // (in-place replan scenario), release it now so the ship
+                // starts flying the just-installed straight-line plan
+                // instead of continuing to hover.
+                this._stationKeepingActive = false;
                 return;
             }
             if (this.mode === 'COMPARE' && compareTestState
@@ -3125,9 +3130,10 @@ class GameScene extends Phaser.Scene {
         // Engage station-keeping on the ship: it stays in its current
         // (position, velocity) state during the sweep by cancelling
         // gravitational forces. See applyGravity + update() for the actual
-        // freeze; here we just flip the flag and reset the fuel accumulator.
+        // freeze; here we just flip the flag. Fuel accumulator is NOT
+        // reset here so it accrues cumulatively across fail-retune-replan
+        // cycles (reset only happens once at scene create).
         this._stationKeepingActive = true;
-        this._stationKeepingFuelSpent = 0;
         // Snapshot the sweep-start wall-clock so we can measure how long
         // planning actually took at hand-off.
         this._sweepStartWallMs = (typeof performance !== 'undefined' && performance.now)
@@ -3424,22 +3430,74 @@ class GameScene extends Phaser.Scene {
                 // still intercept the S->E baseline. Flip to the other side
                 // on a miss; finish when both sides have been swept.
                 const angle = this.slingshotSweepAngle;
+
+                // Hard angular cap. Without this, low-vCruise sweeps run
+                // unbounded: maxTime = 2*lenSE/vCruise grows and every
+                // simulated candidate eventually curves back to cross the
+                // S->E baseline (miss:false with garbage distToEarth), so
+                // the consecutive-miss termination logic never triggers.
+                // 60 deg is well beyond any useful slingshot departure.
+                const MAX_SWEEP_HALF_ANGLE = Math.PI / 3;
+                if (Math.abs(angle) > MAX_SWEEP_HALF_ANGLE) {
+                    // Force the same handling as "consecutive-miss tolerance
+                    // exceeded": flip to the other side, or finalize if
+                    // both sides have been capped.
+                    if (this.slingshotSweepDirection > 0) {
+                        this.slingshotSweepDirection = -1;
+                        this.slingshotSweepAngle = -this.slingshotSweepStep;
+                        this.slingshotSweepConsecMisses = 0;
+                        continue;
+                    }
+                    this.setupFineSweepAroundWinner();
+                    if (this.slingshotSweepMode !== 'fine') {
+                        this.slingshotSweepActive = false;
+                    }
+                    break;
+                }
+
                 const result = simulateForAngle(angle);
                 this.slingshotSweepLastResult = result;
 
+                // A "viable" crossing is one that both (a) crossed the
+                // S->E baseline at least once and (b) did so within a
+                // sane distance of Earth. Wild off-target crossings --
+                // where a chaotic gravity-slingshot loops the ship back
+                // across the baseline thousands of units from Earth --
+                // are what previously kept the consecutive-miss counter
+                // from accumulating past ~90 deg. They still get pushed
+                // to slingshotSweepResults as fallbacks in case nothing
+                // viable is found, but they no longer reset consecMisses.
+                //
+                // Threshold: lenSE (the total S->E distance). Any crossing
+                // further from Earth than that is definitively not a
+                // rescuable candidate. A tighter threshold was tried
+                // (10 * lineHitThreshold) but was too strict -- it caused
+                // premature side-termination on normal seeds where the
+                // real best coarse candidate sits at wider angles and
+                // intermediate angles produce mid-range chaotic crossings.
+                const viableCrossingThreshold = this.slingshotSweepData.lenSE || Number.POSITIVE_INFINITY;
+                const isViableCrossing = !result.miss
+                    && result.distToEarth <= viableCrossingThreshold;
+
                 if (!result.miss) {
+                    // Record every crossing (viable or not) so the
+                    // post-sweep fallback picker has something to work
+                    // with when no viable candidate exists.
                     this.slingshotSweepResults.push({ angle, result });
                     this.slingshotSweepMaxAbsAngle = Math.max(
                         this.slingshotSweepMaxAbsAngle, Math.abs(angle)
                     );
+                }
+
+                if (isViableCrossing) {
                     this.slingshotSweepConsecMisses = 0;
                     this.slingshotSweepAngle += this.slingshotSweepDirection * this.slingshotSweepStep;
                 } else {
-                    // Miss: tolerate isolated misses. Only terminate this
-                    // side after enough consecutive misses have accumulated.
+                    // Either a genuine miss (didn't cross in time) or a
+                    // wildly off-target crossing. Both count toward the
+                    // consecutive-miss termination gate.
                     this.slingshotSweepConsecMisses++;
                     if (this.slingshotSweepConsecMisses < this.slingshotSweepMissTolerance) {
-                        // Skip past this miss and continue in the same direction.
                         this.slingshotSweepAngle += this.slingshotSweepDirection * this.slingshotSweepStep;
                     } else if (this.slingshotSweepDirection > 0) {
                         // Positive side exhausted; flip to negative side.
@@ -3588,10 +3646,12 @@ class GameScene extends Phaser.Scene {
                 }
 
                 this.slingshotSweepFailed = true;
-                // Sweep failed: release station-keeping so the ship falls
-                // under gravity as expected (no plan to fly, no reason to
-                // keep burning fuel holding position).
-                this._stationKeepingActive = false;
+                // Keep station-keeping ENGAGED so the ship holds position
+                // while the player either retunes parameters (fuel keeps
+                // burning against the local gravity gradient in real time)
+                // or clicks a scene-restart option. Fuel will eventually
+                // run out and applyGravity() will release station-keeping
+                // and let the ship fall -- a natural pressure to decide.
                 this._sweepStartWallMs = null;
 
                 const cam = this.cameras.main;
@@ -3600,7 +3660,7 @@ class GameScene extends Phaser.Scene {
                 const msg = this.add.text(
                     cx,
                     cy,
-                    'Autopilot disabled: no viable slingshot trajectory found.\nAdjust Isp / vCruise and restart, or respawn below.',
+                    'No viable slingshot trajectory found.\nRetune parameters live (ship is holding position on thrusters) or respawn below.',
                     {
                         fontSize: '18px',
                         fill: '#ff8080',
@@ -3616,32 +3676,68 @@ class GameScene extends Phaser.Scene {
                 }
 
                 // Give the player a one-click respawn path (same seed or new
-                // seed) in addition to the tuning-panel workflow.
-                this.showRetryPanel();
+                // seed) in addition to the live-retune workflow.
+                this.showRetryPanel({ includeReplan: true });
 
                 return;
             }
 
             let bestResult = chosen.result;
-            const bestAngle = chosen.angle;
+            let bestAngle = chosen.angle;
 
             // ---- Hand-off reconciliation ----
             // The sweep's bestResult was computed against pre-rolled star
             // state (estimated for wall-time T_plan_est). Reality is that
-            // stars have actually evolved for T_plan_actual seconds. Refit
-            // the winning trajectory against the world's current state so
-            // the polyline the autopilot will fly matches what actually
-            // happens when it starts flying it. This is one extra sim call
-            // (~0.5 ms) but eliminates the "plan/reality mismatch" gap.
+            // stars have actually evolved for T_plan_actual seconds. Two
+            // things can go wrong when we swap in "the sweep's winning
+            // angle, re-flown against live stars":
+            //   (a) the exact same angle may no longer be the local
+            //       best -- small star drift shifts the optimum by a few
+            //       hundredths of a degree; and
+            //   (b) a naive swap that only checks .miss (crossed the
+            //       baseline?) can accept a trajectory that crossed but
+            //       sailed right past Earth.
+            // So instead of a single re-sim of bestAngle, run a small
+            // local mini-sweep around it against the live ctx and pick
+            // whichever angle actually gets closest to Earth. Cost is
+            // ~2*windowSteps live sims (typically <1 ms total).
             const liveCtx = this._buildTrajectorySimContext({
                 preRollSec: 0,
                 useLiveShipState: true
             });
+            let liveBest = null;      // best live result
+            let liveBestAngle = bestAngle;
             if (liveCtx) {
-                const liveResult = this._simulateShipTrajectoryNBody(bestAngle, liveCtx);
-                if (liveResult && !liveResult.miss && liveResult.trajectoryPoints
-                    && liveResult.trajectoryPoints.length >= 2) {
-                    bestResult = liveResult;
+                const dAngleRad = Phaser.Math.DegToRad(0.025);
+                const windowSteps = 30;   // +/- 0.75 deg local window
+                // Same 5%-margin star-clip filter used by the coarse and
+                // fine sweeps. Without it the mini-sweep could pick a
+                // live-refit trajectory that clips a star simply because
+                // it crosses the baseline slightly closer to Earth --
+                // installing a plan the earlier sweeps would have rejected.
+                const liveClipRadius = (this.slingshotSweepData.sunRadius || 0) * 1.05;
+                for (let k = -windowSteps; k <= windowSteps; k++) {
+                    const trial = bestAngle + k * dAngleRad;
+                    const r = this._simulateShipTrajectoryNBody(trial, liveCtx);
+                    if (!r || r.miss || !r.trajectoryPoints
+                        || r.trajectoryPoints.length < 2) continue;
+                    if ((r.minDistToStar || 0) <= liveClipRadius) continue;
+                    if (!liveBest || r.distToEarth < liveBest.distToEarth) {
+                        liveBest = r;
+                        liveBestAngle = trial;
+                    }
+                }
+                if (liveBest) {
+                    // Only swap the plan in if the live-refit actually
+                    // reaches Earth (per lineHitThreshold). Otherwise stick
+                    // with the pre-rolled bestResult -- it'll be caught by
+                    // the acceptance gate below and turned into a proper
+                    // sweep-failure if IT also misses.
+                    if (liveBest.distToEarth <= lineHitThreshold
+                        || liveBest.distToEarth < bestResult.distToEarth) {
+                        bestResult = liveBest;
+                        bestAngle = liveBestAngle;
+                    }
                 }
             }
 
@@ -3663,8 +3759,55 @@ class GameScene extends Phaser.Scene {
                 this._lastPlanTimeSec = tPlan;   // for HUD
                 this._sweepStartWallMs = null;
             }
-            const accepted = bestResult.distToEarth <= lineHitThreshold;
+            // Acceptance gate is deliberately looser than the "great plan"
+            // threshold (lineHitThreshold = 0.5 earth-radii = 200 units).
+            // Plans in the 200-800 unit range (up to 2 earth-radii) are
+            // still routinely flown to Earth by CRUISE PID cross-track
+            // correction + BRAKE + landing controller. Rejecting them
+            // outright would fail nearly every real seed. The gate exists
+            // only to catch catastrophic multi-thousand-unit misses that
+            // no downstream controller can rescue.
+            const acceptThreshold = 4 * lineHitThreshold;
+            const accepted = bestResult.distToEarth <= acceptThreshold;
             const winnerSide = (chosen.angle >= 0) ? '+' : '-';
+
+            // Hard acceptance gate: don't hand the autopilot a plan that
+            // doesn't actually reach Earth. Prior code computed `accepted`
+            // only for logging; combined with the pre-roll-driven hand-off
+            // reconciliation this could silently install miss-plans. Fail
+            // out through the same path as "no viable candidate found" so
+            // the player sees the retry panel instead of a ship that
+            // confidently flies past Earth.
+            if (!accepted) {
+                if (typeof console !== 'undefined' && console && console.warn) {
+                    console.warn(
+                        'Slingshot plan rejected at hand-off: distToEarth',
+                        bestResult.distToEarth.toFixed(2),
+                        '> acceptThreshold', acceptThreshold,
+                        '(pre-roll est', (this._lastPlanTimeEstimateSec || 0).toFixed(2),
+                        's, actual', ((this._lastPlanTimeSec || 0)).toFixed(2), 's)'
+                    );
+                }
+                this.slingshotSweepFailed = true;
+                // Keep station-keeping engaged (see equivalent block in
+                // the "no viable candidate" branch above for rationale).
+                const cam = this.cameras.main;
+                const msg = this.add.text(
+                    cam.width / 2, cam.height - 80,
+                    'No viable slingshot trajectory found.\nRetune parameters live (ship is holding position on thrusters) or respawn below.',
+                    {
+                        fontSize: '18px',
+                        fill: '#f88',
+                        backgroundColor: '#200',
+                        align: 'center',
+                        padding: { x: 10, y: 6 }
+                    }
+                ).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+                this.slingshotSweepFailMsg = msg;
+                if (this.autopilot) this.autopilot.enabled = false;
+                this.showRetryPanel({ includeReplan: true });
+                return;
+            }
             const fineImproved = (this.slingshotSweepFineBest && coneWinner &&
                 this.slingshotSweepFineBest.result.distToEarth < coneWinner.result.distToEarth);
             if (typeof console !== 'undefined' && console && console.log) {
@@ -5752,14 +5895,30 @@ class GameScene extends Phaser.Scene {
         this.showRetryPanel();
     }
 
-    showRetryPanel() {
-        // Top-right overlay panel with two retry buttons. Kept separate from
+    showRetryPanel(opts = {}) {
+        // Top-right overlay panel with retry buttons. Kept separate from
         // the existing end-game message so both can coexist. Hidden during
         // TEST/experiment runs (they auto-advance).
+        //
+        // opts.includeReplan: if true, adds a third "Retune & Replan (live)"
+        //   button that opens the in-scene tuning overlay instead of
+        //   restarting. Used when planning failed and station-keeping is
+        //   still holding the ship so the player can retune parameters
+        //   against the live evolving world.
+        const includeReplan = !!opts.includeReplan;
+
+        // Idempotent: if a retry panel is already up, tear it down first
+        // so successive fail-then-retune-then-fail cycles don't stack
+        // panels on top of each other.
+        this._destroyRetryPanel();
+        const created = [];
+        this._retryPanelObjects = created;
+
         const cam = this.cameras.main;
         const pad = 12;
-        const pw = 200;
-        const ph = 110;
+        const pw = 220;
+        const buttonCount = includeReplan ? 3 : 2;
+        const ph = 44 + buttonCount * 34 + 10;
         const px = cam.width - pw - pad;
         const py = pad;
 
@@ -5770,12 +5929,16 @@ class GameScene extends Phaser.Scene {
         panel.fillRect(px, py, pw, ph);
         panel.lineStyle(1, 0x888888, 1.0);
         panel.strokeRect(px, py, pw, ph);
+        created.push(panel);
 
-        this.add.text(px + pw / 2, py + 12, 'Run Complete', {
+        const titleText = includeReplan ? 'Plan Failed' : 'Run Complete';
+        const titleColor = includeReplan ? '#ffcc66' : '#ffffff';
+        const title = this.add.text(px + pw / 2, py + 12, titleText, {
             fontSize: '14px',
-            fill: '#ffffff',
+            fill: titleColor,
             fontStyle: 'bold'
         }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(2101);
+        created.push(title);
 
         const makeButton = (label, cy, onClick) => {
             const bw = pw - 20;
@@ -5797,7 +5960,6 @@ class GameScene extends Phaser.Scene {
                 fontSize: '13px',
                 fill: '#ffffff'
             }).setOrigin(0.5).setScrollFactor(0).setDepth(2102);
-            // Hit-area zone for input.
             const zone = this.add.zone(bx, by, bw, bh)
                 .setOrigin(0, 0)
                 .setScrollFactor(0)
@@ -5807,17 +5969,211 @@ class GameScene extends Phaser.Scene {
             zone.on('pointerout',  () => draw(0x2255aa));
             zone.on('pointerdown', () => draw(0x1a4488));
             zone.on('pointerup',   () => { draw(0x2255aa); onClick(); });
+            created.push(bg, txt, zone);
         };
 
-        makeButton('Retry Same Seed', 38, () => {
+        let nextY = 38;
+        if (includeReplan) {
+            makeButton('Retune & Replan (live)', nextY, () => {
+                this._showInPlaceTuningPanel();
+            });
+            nextY += 34;
+        }
+        makeButton('Retry Same Seed', nextY, () => {
             this.replayRequested = true;
             this.scene.restart();
         });
-        makeButton('New Seed', 72, () => {
+        nextY += 34;
+        makeButton('New Seed', nextY, () => {
             this.replayRequested = false;
             this.worldSnapshot = null;
             this.scene.restart();
         });
+    }
+
+    // In-scene tuning overlay used only after a plan failure. Draws the
+    // same slider set as the full-screen Tuning menu, but Apply triggers
+    // an in-place replan (no scene restart) so the world's current live
+    // star state feeds the new sweep. Cancel dismisses without replanning.
+    _showInPlaceTuningPanel() {
+        // Idempotent -- if the overlay is already up, do nothing.
+        if (this._inPlaceTuningObjects && this._inPlaceTuningObjects.length > 0) {
+            return;
+        }
+        const created = [];
+        this._inPlaceTuningObjects = created;
+
+        const w = this.cameras.main.width;
+        const h = this.cameras.main.height;
+        const centerX = w / 2;
+        const centerY = h / 2;
+
+        const panelWidth = 780;
+        const rowSpacing = 22;
+        const paramCount = tuningParamsDefinition.length;
+        const panelHeight = paramCount * rowSpacing + 200;
+
+        const bg = this.add.rectangle(centerX, centerY, panelWidth, panelHeight, 0x000000, 0.92)
+            .setScrollFactor(0)
+            .setDepth(3000)
+            .setStrokeStyle(2, 0xffcc66, 0.75);
+        created.push(bg);
+
+        const titleY = centerY - panelHeight / 2 + 24;
+        const title = this.add.text(centerX, titleY,
+            'Retune Parameters (world continues to evolve in real time)', {
+            fontSize: '20px',
+            fill: '#ffcc66',
+            fontStyle: 'bold'
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(3001);
+        created.push(title);
+
+        const rowsStartY = titleY + 34;
+        const sliderWidthPx = 300;
+        const paramRows = [];
+
+        tuningParamsDefinition.forEach((def, idx) => {
+            const y = rowsStartY + idx * rowSpacing;
+
+            const labelText = this.add.text(centerX - 370, y, def.label + ':', {
+                fontSize: '14px',
+                fill: '#ffddaa'
+            }).setOrigin(0, 0.5).setScrollFactor(0).setDepth(3001);
+            created.push(labelText);
+
+            const valueText = this.add.text(centerX - 20, y, '', {
+                fontSize: '14px',
+                fill: '#0f0'
+            }).setOrigin(1, 0.5).setScrollFactor(0).setDepth(3001);
+            created.push(valueText);
+
+            const initialValue = activeTuningParams[def.key];
+            const stepAttr = (typeof def.step === 'number' && def.step > 0) ? def.step : 'any';
+
+            const slider = this.add.dom(centerX + 150, y).createFromHTML(
+                `<input type="range" min="${def.min}" max="${def.max}" step="${stepAttr}" value="${initialValue}" style="width:${sliderWidthPx}px; accent-color:#ffcc66;" />`
+            );
+            slider.setOrigin(0.5, 0.5).setScrollFactor(0).setDepth(3001);
+            created.push(slider);
+
+            const sliderEl = slider.node && slider.node.querySelector('input');
+            const commit = () => {
+                if (!sliderEl) return;
+                let v = parseFloat(sliderEl.value);
+                if (Number.isNaN(v)) return;
+                if (typeof def.min === 'number') v = Math.max(v, def.min);
+                if (typeof def.max === 'number') v = Math.min(v, def.max);
+                activeTuningParams[def.key] = v;
+                valueText.setText(v.toFixed(def.decimals));
+                saveTuningToStorage();
+            };
+            if (sliderEl) {
+                sliderEl.addEventListener('input', commit);
+                sliderEl.addEventListener('change', commit);
+            }
+            valueText.setText(initialValue.toFixed(def.decimals));
+            paramRows.push({ def, valueText });
+        });
+
+        const lastY = rowsStartY + (paramCount - 1) * rowSpacing;
+        const hint = this.add.text(centerX, lastY + 28,
+            'Stars keep moving. Fuel keeps burning against station-keeping. Apply to run a fresh sweep against the world as it is right now.', {
+            fontSize: '12px',
+            fill: '#bbbbbb',
+            align: 'center',
+            wordWrap: { width: panelWidth - 60 }
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(3001);
+        created.push(hint);
+
+        const makeButton = (label, cx, cy, color, onClick) => {
+            const btnBg = this.add.rectangle(cx, cy, 220, 36, color, 0.9)
+                .setScrollFactor(0)
+                .setDepth(3001)
+                .setStrokeStyle(1, 0xffffff, 0.6)
+                .setInteractive({ useHandCursor: true });
+            const btnText = this.add.text(cx, cy, label, {
+                fontSize: '17px',
+                fill: '#ffffff',
+                fontStyle: 'bold'
+            }).setOrigin(0.5).setScrollFactor(0).setDepth(3002);
+            btnBg.on('pointerdown', onClick);
+            created.push(btnBg, btnText);
+        };
+
+        const btnY = lastY + 78;
+        makeButton('Apply & Replan', centerX - 130, btnY, 0x226644, () => {
+            this._destroyInPlaceTuningPanel();
+            this._replanInPlace();
+        });
+        makeButton('Cancel', centerX + 130, btnY, 0x552222, () => {
+            this._destroyInPlaceTuningPanel();
+        });
+    }
+
+    _destroyInPlaceTuningPanel() {
+        if (this._inPlaceTuningObjects) {
+            for (const o of this._inPlaceTuningObjects) {
+                if (o && typeof o.destroy === 'function') {
+                    try { o.destroy(); } catch (e) { /* already gone */ }
+                }
+            }
+            this._inPlaceTuningObjects = null;
+        }
+    }
+
+    // Tear down all plan-failure UI, reset slingshot sweep state, and
+    // re-invoke refineSlingshotPlanNumerically() so it runs a fresh sweep
+    // against the world's current live star state (via
+    // _buildTrajectorySimContext, which snapshots live positions/velocities).
+    // Station-keeping was left engaged when the plan failed, so the ship
+    // is still holding position and the ship velocity is still 0 -- no
+    // hand-off discontinuity. Fuel spent so far is preserved.
+    _replanInPlace() {
+        // Tear down failure UI.
+        this._destroyRetryPanel();
+        this._destroyInPlaceTuningPanel();
+        if (this.slingshotSweepFailMsg) {
+            try { this.slingshotSweepFailMsg.destroy(); } catch (e) { /* gone */ }
+            this.slingshotSweepFailMsg = null;
+        }
+        // Reset slingshot sweep state so refineSlingshotPlanNumerically
+        // starts from a clean slate.
+        this.slingshotPlan = null;
+        this.slingshotSweepActive = false;
+        this.slingshotSweepFailed = false;
+        this.slingshotSweepData = null;
+        this.slingshotSweepResults = [];
+        this.slingshotSweepFineBest = null;
+        this.slingshotSweepPosBest = null;
+        this.slingshotSweepNegBest = null;
+        this.slingshotSweepLastResult = null;
+        if (this.slingshotSweepCurrentGraphics) {
+            this.slingshotSweepCurrentGraphics.clear();
+        }
+        if (this.slingshotDebug) {
+            this.slingshotDebug.clear();
+        }
+        // Ensure station-keeping is engaged for the new sweep. If fuel
+        // ran out before the user clicked Retune, applyGravity() will
+        // have already cleared the flag; in that case turning it back
+        // on here does nothing useful (fuel = 0 -> no thrust in the
+        // controller), but it doesn't hurt either.
+        this._stationKeepingActive = true;
+        // Re-invoke the planner. It snapshots live star state via
+        // _buildTrajectorySimContext({ useLiveShipState: true }), so the
+        // new sweep sees exactly the world the ship is currently in.
+        this.refineSlingshotPlanNumerically();
+    }
+
+    _destroyRetryPanel() {
+        if (this._retryPanelObjects) {
+            for (const o of this._retryPanelObjects) {
+                if (o && typeof o.destroy === 'function') {
+                    try { o.destroy(); } catch (e) { /* already gone */ }
+                }
+            }
+            this._retryPanelObjects = null;
+        }
     }
 
     // Compare-ensemble helpers ------------------------------------------
