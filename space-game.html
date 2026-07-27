@@ -685,6 +685,27 @@ class AutopilotController {
             }
         }
 
+        // ORIENT / BOOST: lock the target heading to the plan's launch
+        // direction (plan.dirX, plan.dirY) instead of the polyline tangent.
+        // The trajectory sim performs an INERTIAL burn -- thrust is fixed at
+        // (cos(angleOffset), sin(angleOffset)) throughout BOOST, and gravity
+        // does whatever it does. Previously live's target heading tracked
+        // the polyline tangent, which rotates as the ship advances along the
+        // gravity-bent path; live was effectively doing a prograde-ish burn
+        // instead of an inertial one, producing a genuinely different
+        // trajectory shape and reaching each waypoint late relative to the
+        // sim's prediction. Locking to plan.dirX/dirY makes live match sim
+        // exactly during BOOST. ORIENT uses the same target so the bang-bang
+        // lands on the exact heading BOOST wants (no discontinuity at the
+        // ORIENT -> BOOST transition).
+        if (plan &&
+            (this.currentPhase === this.phases.ORIENT ||
+             this.currentPhase === this.phases.BOOST) &&
+            typeof plan.dirX === 'number' && typeof plan.dirY === 'number') {
+            nx = plan.dirX;
+            ny = plan.dirY;
+        }
+
         // During CRUISE, if a v_tan correction is active, point exactly opposite v_tan.
         if (this.currentPhase === this.phases.CRUISE && this.vTanCorrectionActive && tangentialCorr > 1e-3) {
             const tx = vtCorrX / tangentialCorr;
@@ -2475,9 +2496,15 @@ class GameScene extends Phaser.Scene {
     }
 
     startStarMotion() {
-        // Apply stored velocities to each gravity object's physics body so
-        // Phaser advances their positions each frame. Idempotent (guarded by
-        // this.starMotionStarted).
+        // Apply stored velocities to each gravity object's physics body.
+        // Position integration is done manually in updateStarGravity at a
+        // fixed dt = 1/60 s (see body.moves = false below), so the live
+        // star clock stays synchronized with the sim's fixed-step integrator
+        // regardless of browser frame rate (Phaser's deltaMs can drift from
+        // 16.7 ms on slower machines / VSync misses, which previously caused
+        // live stars to advance at a different real-time rate than the sim
+        // predicted -- yielding the "ship lags behind stars" symptom).
+        // Idempotent (guarded by this.starMotionStarted).
         if (this.starMotionStarted) return;
         if (!this.gravityObjects || this.gravityObjects.length === 0) return;
         for (const obj of this.gravityObjects) {
@@ -2485,67 +2512,109 @@ class GameScene extends Phaser.Scene {
             const vy = obj.getData('vy');
             if (typeof vx === 'number' && typeof vy === 'number' && obj.body) {
                 obj.body.setVelocity(vx, vy);
+                // Take over position integration from Phaser so we can run
+                // it at a fixed 1/60 s step matching the sim.
+                obj.body.moves = false;
             }
         }
         this.starMotionStarted = true;
+        // Reset the fixed-step accumulator (leftover time from prior
+        // scenes should not persist across restarts).
+        this._starDtAccumMs = 0;
     }
 
     updateStarGravity(deltaMs) {
-        // Per-frame N-body update: accumulate pairwise gravitational
-        // accelerations between every pair of massive objects (stars) and
-        // apply them to each star's Phaser body velocity. Phaser then
-        // advances each star's position from its (now-updated) velocity.
-        // Runs only after startStarMotion (i.e., after the sweep completes,
-        // or immediately in MANUAL mode). Mirrors the N-body loop inside
-        // simulateForAngle so runtime motion tracks what the sweep planned.
+        // Fixed-timestep N-body update. Accumulates real wall-time deltaMs
+        // and runs integer sub-steps of exactly 1/60 s each until the
+        // accumulator is drained. This decouples live star motion from the
+        // browser's frame rate so its integrator matches the trajectory
+        // sim's fixed-step integrator step-for-step (see
+        // _buildTrajectorySimContext's `dt = 1/60`). Previously we ran a
+        // single symplectic-Euler step per Phaser frame using deltaMs as dt,
+        // which meant on slower machines the live star clock ticked at a
+        // different real-time rate than the sim predicted -- producing the
+        // "ship lags behind stars" symptom that grew monotonically over the
+        // flight.
+        //
+        // Position integration is done manually here (body.moves = false was
+        // set in startStarMotion), so we update both body.velocity for the
+        // next step and sprite.x/y for rendering and gravity lookups.
+        //
+        // Sub-step count is capped (MAX_SUBSTEPS) to prevent a spiral-of-
+        // death after tab-backgrounding or GC pauses; any leftover time
+        // beyond the cap is dropped (equivalent to a small clock-skip).
         if (!this.starMotionStarted) return;
         const stars = this.gravityObjects;
         if (!stars || stars.length < 2) return;
 
-        const dt = deltaMs / 1000;
+        const STAR_STEP_MS = 1000 / 60;
+        const STAR_STEP_S  = 1 / 60;
+        const MAX_SUBSTEPS = 8;
+
+        this._starDtAccumMs = (this._starDtAccumMs || 0) + deltaMs;
+        let substeps = 0;
         const N = stars.length;
 
-        // Precompute mu, x, y per star (avoid repeated getData calls).
+        // Reusable per-star scratch arrays -- allocated once per call
+        // (allocating inside the sub-step loop showed up as GC pressure
+        // in profiling on prior versions of this loop).
         const sx = new Array(N);
         const sy = new Array(N);
         const mu = new Array(N);
         for (let i = 0; i < N; i++) {
-            sx[i] = stars[i].x;
-            sy[i] = stars[i].y;
             mu[i] = stars[i].getData('gravityStrength') || 0;
         }
+        const ax = new Array(N);
+        const ay = new Array(N);
 
-        // Symmetric pairwise sum: accel on i from j uses mu[j], and by
-        // Newton's third law the accel on j from i uses mu[i] along the
-        // opposite direction.
-        const ax = new Array(N).fill(0);
-        const ay = new Array(N).fill(0);
-        for (let i = 0; i < N; i++) {
-            for (let j = i + 1; j < N; j++) {
-                const dxij = sx[j] - sx[i];
-                const dyij = sy[j] - sy[i];
-                const r2 = dxij * dxij + dyij * dyij;
-                const r  = Math.sqrt(r2);
-                if (r > 1) {
-                    const gj = mu[j] / r2;
-                    const gi = mu[i] / r2;
-                    const ux = dxij / r;
-                    const uy = dyij / r;
-                    ax[i] += ux * gj;
-                    ay[i] += uy * gj;
-                    ax[j] -= ux * gi;
-                    ay[j] -= uy * gi;
+        while (this._starDtAccumMs >= STAR_STEP_MS && substeps < MAX_SUBSTEPS) {
+            // Snapshot current positions for this sub-step.
+            for (let i = 0; i < N; i++) {
+                sx[i] = stars[i].x;
+                sy[i] = stars[i].y;
+                ax[i] = 0;
+                ay[i] = 0;
+            }
+            // Symmetric pairwise sum: accel on i from j uses mu[j]; by
+            // Newton's third law the accel on j from i uses mu[i] along
+            // the opposite direction.
+            for (let i = 0; i < N; i++) {
+                for (let j = i + 1; j < N; j++) {
+                    const dxij = sx[j] - sx[i];
+                    const dyij = sy[j] - sy[i];
+                    const r2 = dxij * dxij + dyij * dyij;
+                    const r  = Math.sqrt(r2);
+                    if (r > 1) {
+                        const gj = mu[j] / r2;
+                        const gi = mu[i] / r2;
+                        const ux = dxij / r;
+                        const uy = dyij / r;
+                        ax[i] += ux * gj;
+                        ay[i] += uy * gj;
+                        ax[j] -= ux * gi;
+                        ay[j] -= uy * gi;
+                    }
                 }
             }
+            // Symplectic Euler: v_{n+1} = v_n + a_n * dt; x_{n+1} = x_n +
+            // v_{n+1} * dt. Matches _preRollStarsInPlace and the sim's
+            // inline star integrator.
+            for (let i = 0; i < N; i++) {
+                const body = stars[i].body;
+                if (!body) continue;
+                body.velocity.x += ax[i] * STAR_STEP_S;
+                body.velocity.y += ay[i] * STAR_STEP_S;
+                stars[i].x += body.velocity.x * STAR_STEP_S;
+                stars[i].y += body.velocity.y * STAR_STEP_S;
+            }
+            this._starDtAccumMs -= STAR_STEP_MS;
+            substeps++;
         }
 
-        // Apply velocity changes. (Positions are integrated by Phaser from
-        // body.velocity on the next physics step.)
-        for (let i = 0; i < N; i++) {
-            const body = stars[i].body;
-            if (!body) continue;
-            body.velocity.x += ax[i] * dt;
-            body.velocity.y += ay[i] * dt;
+        // Drop remainder if we hit the sub-step cap (tab-backgrounded etc.)
+        // to avoid running arbitrarily many steps in future frames.
+        if (substeps >= MAX_SUBSTEPS) {
+            this._starDtAccumMs = 0;
         }
     }
 
@@ -2620,12 +2689,17 @@ class GameScene extends Phaser.Scene {
     // what will exist in the world at plan hand-off. Falls back to a fixed
     // default before any sweeps have completed on this scene instance.
     _getPlanTimeEstimate() {
+        // Multiplier on the measured/default T_plan estimate. 1.0 =
+        // canonical forward pre-roll (sim's t=0 star state = live stars at
+        // snapshot + T_plan_est). Values > 1 over-advance; values < 0
+        // integrate backwards. Kept as a knob for tuning experiments.
+        const PLAN_TIME_SAFETY_MULT = 1.0;
         if (RECENT_PLAN_TIMES_SEC.length === 0) {
-            return DEFAULT_PLAN_TIME_ESTIMATE_SEC;
+            return PLAN_TIME_SAFETY_MULT * DEFAULT_PLAN_TIME_ESTIMATE_SEC;
         }
         let s = 0;
         for (const t of RECENT_PLAN_TIMES_SEC) s += t;
-        return s / RECENT_PLAN_TIMES_SEC.length;
+        return PLAN_TIME_SAFETY_MULT * (s / RECENT_PLAN_TIMES_SEC.length);
     }
 
     // Advance the given (starX, starY, starVX, starVY) arrays forward by
@@ -2635,11 +2709,17 @@ class GameScene extends Phaser.Scene {
     // no gravity of consequence and its own motion is trivial to predict).
     // Mutates the arrays in place.
     _preRollStarsInPlace(masses, starX, starY, starVX, starVY, preRollSec, dt) {
-        if (preRollSec <= 0) return;
+        if (preRollSec === 0) return;
         const N = masses.length;
         const starAX = new Array(N);
         const starAY = new Array(N);
-        const steps = Math.max(1, Math.ceil(preRollSec / dt));
+        // Support both forward (preRollSec > 0) and backward (preRollSec < 0)
+        // integration. Step count is based on |preRollSec|; stepDt carries the
+        // sign so the symplectic-Euler update below naturally integrates in
+        // the desired direction. Backward integration is only stable over
+        // the short horizons used here (~0.05 to a few seconds).
+        const absPreRoll = Math.abs(preRollSec);
+        const steps = Math.max(1, Math.ceil(absPreRoll / Math.abs(dt)));
         const stepDt = preRollSec / steps;
         for (let step = 0; step < steps; step++) {
             for (let i = 0; i < N; i++) { starAX[i] = 0; starAY[i] = 0; }
@@ -2687,7 +2767,9 @@ class GameScene extends Phaser.Scene {
     // Returns null if the world doesn't yet have valid inputs.
     _buildTrajectorySimContext(opts = {}) {
         if (!this.gravityObjects || this.gravityObjects.length === 0) return null;
-        const preRollSec = (typeof opts.preRollSec === 'number' && opts.preRollSec > 0)
+        // Signed pre-roll: positive = advance stars forward from live
+        // snapshot, negative = integrate backwards. Non-finite -> 0.
+        const preRollSec = (typeof opts.preRollSec === 'number' && Number.isFinite(opts.preRollSec))
             ? opts.preRollSec : 0;
         const useLiveShipState = !!opts.useLiveShipState;
 
@@ -2721,7 +2803,16 @@ class GameScene extends Phaser.Scene {
         const vCruise = (activeTuningParams && activeTuningParams.vCruise) || 250;
         if (vCruise <= 0) return null;
 
-        const dt          = 0.04;
+        // Sim integration step. Matched to Phaser's default 60 Hz frame
+        // rate (1/60 s) so the sim's star integrator accumulates
+        // approximately the same numerical error as the live game's
+        // updateStarGravity. Prior value 0.04 (25 Hz) diverged from live
+        // by O(dt) in symplectic-Euler phase drift, which chaotic N-body
+        // dynamics amplified over ~5-10 s of flight into visible star
+        // position offsets and forced heavy CRUISE-PID side-thruster
+        // corrections. maxSteps below scales with 1/dt so the max flight
+        // horizon in seconds is preserved. Sweep CPU cost rises ~2.4x.
+        const dt          = 1 / 60;
         const maxTime     = 2 * lenSE / vCruise;
         const maxSteps    = Math.floor(maxTime / dt);
         const thrustForce = currentMainThrustForce();
@@ -2738,8 +2829,10 @@ class GameScene extends Phaser.Scene {
             initShipVY = this.player.body.velocity.y || 0;
         }
 
-        // Pre-roll stars in place under full mutual gravity.
-        if (preRollSec > 0) {
+        // Pre-roll stars in place under full mutual gravity. Runs for both
+        // positive (forward-in-time) and negative (backward-in-time)
+        // preRollSec; _preRollStarsInPlace carries the sign into stepDt.
+        if (preRollSec !== 0) {
             const N = masses.length;
             const starX = new Array(N), starY = new Array(N);
             const starVX = new Array(N), starVY = new Array(N);
@@ -2772,6 +2865,24 @@ class GameScene extends Phaser.Scene {
         // pays this delay every hand-off; without it the sim's timeline is
         // systematically ahead of reality by 0.3-1.0 s.
         const angularAccel = (this.autopilot && this.autopilot.angularAccel) || 3.0;
+        // BRAKE-model tuning. The sim mirrors live's bang-bang BRAKE
+        // controller so its crossTime reflects the multi-second deceleration
+        // window near Earth (previously the sim treated the final ~1000-1500
+        // units as ballistic and arrived 1-3 s early). Fields:
+        //   brakeTargetVr    inward radial velocity to hold during BRAKE
+        //   brakeDistScale   safety-margin multiplier on the analytic
+        //                    braking distance (matches autopilot's use).
+        //   kBrake, tTurnEst constants pulled from AutopilotController so
+        //                    the sim's brakeDist matches live exactly.
+        //   brakeThrustScale main-engine throttle used during BRAKE (0.95,
+        //                    matches AutopilotController.computeControl).
+        const brakeTargetVr   = (activeTuningParams && typeof activeTuningParams.brakeTargetVr === 'number')
+            ? activeTuningParams.brakeTargetVr : -60;
+        const brakeDistScale  = (activeTuningParams && typeof activeTuningParams.brakeDistScale === 'number')
+            ? activeTuningParams.brakeDistScale : 1.25;
+        const kBrake          = (this.autopilot && this.autopilot.kBrake) || 2.0;
+        const tTurnEst        = (this.autopilot && this.autopilot.tTurnEst) || 2.0;
+        const brakeThrustScale = 0.95;
 
         return {
             Sx, Sy, Ex, Ey,
@@ -2783,6 +2894,11 @@ class GameScene extends Phaser.Scene {
             earthRadius: 80 * 5,        // matches createEarth
             earthMu,
             angularAccel,
+            brakeTargetVr,
+            brakeDistScale,
+            kBrake,
+            tTurnEst,
+            brakeThrustScale,
             dt, maxSteps, maxTime,
             thrustForce,
             fuelBurnRate: thrustForce / exhaustVel,
@@ -2827,6 +2943,20 @@ class GameScene extends Phaser.Scene {
         // (see AutopilotController's ORIENT case). During this window the
         // ship coasts under gravity only; boosting is inhibited.
         const tOrient = 2 * Math.sqrt(Math.abs(angleOffset) / Math.max(angularAccel, 1e-3));
+        // BRAKE-model constants (optional; default to disabled/no-op for
+        // legacy ctx builders like the compare-test straight-line ctx).
+        // When brakeModelEnabled is true, the sim fires the main engine
+        // radially-outward whenever the ship is within brakeDist of Earth's
+        // surface AND radialV is more inward than brakeTargetVr AND fuel
+        // remains. This mirrors AutopilotController.computeControl's BRAKE
+        // block and gives the sim's crossTime the same terminal decel
+        // window as live physics.
+        const brakeTargetVr    = (typeof ctx.brakeTargetVr === 'number') ? ctx.brakeTargetVr : null;
+        const brakeDistScale   = (typeof ctx.brakeDistScale === 'number') ? ctx.brakeDistScale : 1.25;
+        const kBrake           = (typeof ctx.kBrake === 'number') ? ctx.kBrake : 2.0;
+        const tTurnEst         = (typeof ctx.tTurnEst === 'number') ? ctx.tTurnEst : 2.0;
+        const brakeThrustScale = (typeof ctx.brakeThrustScale === 'number') ? ctx.brakeThrustScale : 0.95;
+        const brakeModelEnabled = (brakeTargetVr !== null);
 
         // Initial ship state defaults to rest-at-S but callers can override
         // via ctx.initShip = { x, y, vx, vy } to plan from an arbitrary
@@ -2882,7 +3012,17 @@ class GameScene extends Phaser.Scene {
         let stopT = null;
 
         const recordEvery = 5;
-        const trajectoryPoints = [{ x, y }];
+        // Polyline recording is deferred until t >= tOrient so the first
+        // segment's tangent is the BOOST direction (angleOffset), not the
+        // ORIENT-drift direction (local gravity). AutopilotController's
+        // getSlingshotPathFrame uses this tangent as the ORIENT bang-bang
+        // target; if the tangent points along gravity, the ship rotates the
+        // wrong way and pays the correction cost mid-BOOST as a systematic
+        // 1-2 s of thrust off-axis. Physics inside the sim still integrates
+        // the pre-BOOST drift (star motion, ship gravity coast) -- we just
+        // don't publish that segment as part of the reference path.
+        const trajectoryPoints = [];
+        let firstPointRecorded = false;
 
         for (let step = 0; step < maxSteps; step++) {
             let ax = 0;
@@ -2943,6 +3083,45 @@ class GameScene extends Phaser.Scene {
                     ay += (dyE / rE) * gE;
                 }
             }
+
+            // BRAKE-thrust model. Once past BOOST (boosting=false), if the
+            // ship is inside the analytic braking corridor and still falling
+            // faster than brakeTargetVr, fire the main engine radially
+            // outward (mirrors AutopilotController.computeControl's BRAKE
+            // block). Skipped entirely when brakeModelEnabled=false. Uses
+            // the same brakeDist formula as autopilot.updatePhase.
+            if (brakeModelEnabled && !boosting && fuel > 0) {
+                const dxEb = Ex - x;
+                const dyEb = Ey - y;
+                const rEb  = Math.sqrt(dxEb * dxEb + dyEb * dyEb);
+                if (rEb > 1) {
+                    // Outward-radial unit vector (from Earth center to ship).
+                    const uxOut = -dxEb / rEb;
+                    const uyOut = -dyEb / rEb;
+                    const radialV = vx * uxOut + vy * uyOut;   // <0 = inward
+                    const distToSurface = rEb - earthRadius;
+                    const massNow = dryMass + fuel;
+                    const aBrakeAccel = thrustForce / Math.max(massNow, 1e-6);
+                    const vRadialMag = Math.max(Math.abs(radialV), 1);
+                    const brakeBase = kBrake * vRadialMag * vRadialMag / (2 * aBrakeAccel)
+                                    + vCruise * tTurnEst;
+                    const brakeDist = brakeDistScale * brakeBase;
+                    if (distToSurface <= brakeDist && radialV < brakeTargetVr) {
+                        // Assume alignedForBrake=true (sim doesn't model
+                        // attitude PID). Slight optimism vs live's chattering
+                        // bang-bang but the timing error is bounded by the
+                        // few extra 16 ms frames live needs to re-align.
+                        const F = thrustForce * brakeThrustScale;
+                        const Fx = uxOut * F;
+                        const Fy = uyOut * F;
+                        const aRelB = relativisticThrustAccel(Fx, Fy, massNow, vx, vy);
+                        ax += aRelB.ax;
+                        ay += aRelB.ay;
+                        fuel -= fuelBurnRate * brakeThrustScale * dt;
+                        if (fuel < 0) fuel = 0;
+                    }
+                }
+            }
             if (killed) {
                 trajectoryPoints.push({ x, y });
                 return {
@@ -2992,8 +3171,16 @@ class GameScene extends Phaser.Scene {
             y += vy * dt;
             t += dt;
 
-            if ((step + 1) % recordEvery === 0) {
-                trajectoryPoints.push({ x, y });
+            if (t >= tOrient) {
+                if (!firstPointRecorded) {
+                    // First published sample = ship state at BOOST ignition.
+                    // Guarantees the polyline is non-empty and its first
+                    // segment tangent is the initial BOOST velocity direction.
+                    trajectoryPoints.push({ x, y });
+                    firstPointRecorded = true;
+                } else if ((step + 1) % recordEvery === 0) {
+                    trajectoryPoints.push({ x, y });
+                }
             }
 
             const dxE = x - Ex;
@@ -3223,8 +3410,16 @@ class GameScene extends Phaser.Scene {
         // simCtx.masses forward in-place so every candidate is always
         // scored against a not-yet-past star projection instead of a
         // stale pre-roll snapshot.
-        this._simCtxProjectedWallMs = this._sweepStartWallMs
-            + this._lastPlanTimeEstimateSec * 1000;
+        // When the estimate is non-negative, anchor simCtx to the projected
+        // hand-off wall time so the adaptive block below advances stars
+        // whenever real wall time overshoots the projection. When the
+        // estimate is NEGATIVE (experimental backward pre-roll), disable
+        // adaptive advancement -- otherwise "nowMs > projected" fires
+        // immediately (projected is in the past) and wipes out the
+        // intended backward pre-roll on the first sweep frame.
+        this._simCtxProjectedWallMs = (this._lastPlanTimeEstimateSec >= 0)
+            ? this._sweepStartWallMs + this._lastPlanTimeEstimateSec * 1000
+            : null;
         const {
             Sx, Sy, Ex, Ey,
             dxSE, dySE, lenSE,
@@ -3296,7 +3491,8 @@ class GameScene extends Phaser.Scene {
             // Earth radius used in createEarth (80 * 5).
             earthRadius: 80 * 5,
             lineHitThreshold: 0.5 * (80 * 5),
-            dt: 0.04,
+            // Kept in sync with _buildTrajectorySimContext's dt (1/60 s).
+            dt: 1 / 60,
             maxTime,
             // Full pre-rolled ctx: updateSlingshotSweep hands this directly
             // to _simulateShipTrajectoryNBody so every candidate is scored
@@ -3554,8 +3750,11 @@ class GameScene extends Phaser.Scene {
                 // simulated candidate eventually curves back to cross the
                 // S->E baseline (miss:false with garbage distToEarth), so
                 // the consecutive-miss termination logic never triggers.
-                // 60 deg is well beyond any useful slingshot departure.
-                const MAX_SWEEP_HALF_ANGLE = Math.PI / 3;
+                // Cap kept at 10 deg per side to reject wide-angle
+                // trajectories that only reach Earth because the BRAKE
+                // phase rescues them (producing high-energy, indirect
+                // slingshots that visually and physically look wrong).
+                const MAX_SWEEP_HALF_ANGLE = Phaser.Math.DegToRad(10);
                 if (Math.abs(angle) > MAX_SWEEP_HALF_ANGLE) {
                     // Force the same handling as "consecutive-miss tolerance
                     // exceeded": flip to the other side, or finalize if
@@ -3826,12 +4025,16 @@ class GameScene extends Phaser.Scene {
             // installed -- not the state at the moment we snapshot. Without
             // this, stars drift ~50 ms during the mini-sweep and the
             // installed plan's t=0 is already stale by BOOST ignition.
+            // Multiplier on the measured/default T_mini estimate. 1.0 =
+            // canonical forward pre-roll.
+            const MINISWEEP_TIME_SAFETY_MULT = 1.0;
             let miniSweepEstSec = DEFAULT_MINISWEEP_TIME_ESTIMATE_SEC;
             if (RECENT_MINISWEEP_TIMES_SEC.length > 0) {
                 let s = 0;
                 for (const t of RECENT_MINISWEEP_TIMES_SEC) s += t;
                 miniSweepEstSec = s / RECENT_MINISWEEP_TIMES_SEC.length;
             }
+            miniSweepEstSec *= MINISWEEP_TIME_SAFETY_MULT;
             const miniSweepStartMs = (typeof performance !== 'undefined' && performance.now)
                 ? performance.now()
                 : Date.now();
