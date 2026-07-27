@@ -1,7 +1,7 @@
 # Space Race — Relativistic Journey
 
 > **Note:** This project (including this README file) was generated with AI assistance, obviously, via the Cascade / Windsurf agent through iterative prompting.
-> A small error in the simulator causes some trajectories to lag behind the expected trajectory, sometimes causing the ship to crash. The cause for this has not been found. 
+> A small error in the simulator causes some trajectories to lag behind the expected trajectory, sometimes causing the ship to crash into a star. The cause for this has not been found. 
 
 ## What it is
 
