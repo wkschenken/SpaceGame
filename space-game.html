@@ -117,6 +117,14 @@
     const RECENT_PLAN_TIMES_SEC = [];
     const RECENT_PLAN_TIMES_MAX = 5;
     const DEFAULT_PLAN_TIME_ESTIMATE_SEC = 0.5;
+    // Rolling buffer of recent hand-off mini-sweep durations. Used to
+    // pre-roll the live-star ctx by the expected mini-sweep duration so
+    // the final refinement's t=0 star state matches the star state that
+    // will exist when the mini-sweep completes (and thus at plan install /
+    // BOOST ignition). Module scope for the same reason as RECENT_PLAN_TIMES_SEC.
+    const RECENT_MINISWEEP_TIMES_SEC = [];
+    const RECENT_MINISWEEP_TIMES_MAX = 5;
+    const DEFAULT_MINISWEEP_TIME_ESTIMATE_SEC = 0.05;
     const ISP_REF = 300;
     const ISP_TO_VE = 5000 / ISP_REF; // so v_e(Isp=300) = 5000
     const REFERENCE_THRUST_FORCE = 150 * (SHIP_DRY_MASS + INITIAL_FUEL_MASS); // 22500
@@ -2749,6 +2757,22 @@ class GameScene extends Phaser.Scene {
             initShipY += initShipVY * preRollSec;
         }
 
+        // Earth's gravitational parameter as used by applyGravity (live
+        // physics): earthGravityStrength = 40000 * 5. The sim historically
+        // omitted this and treated Earth as a purely geometric target, which
+        // biased ballistic-coast timing and gravitational deflection near
+        // the target. Passed through ctx so _simulateShipTrajectoryNBody
+        // can add it to the per-step force accumulation.
+        const earthMu = 40000 * 5;
+        // Autopilot angular acceleration (rad/s^2) for the ORIENT bang-bang
+        // schedule. Used by the sim to model the ORIENT delay before BOOST
+        // begins: the ship coasts under gravity only for
+        //   tOrient = 2 * sqrt(|angleOffset| / angularAccel)
+        // seconds after t=0 before the main engine ignites. Live autopilot
+        // pays this delay every hand-off; without it the sim's timeline is
+        // systematically ahead of reality by 0.3-1.0 s.
+        const angularAccel = (this.autopilot && this.autopilot.angularAccel) || 3.0;
+
         return {
             Sx, Sy, Ex, Ey,
             dxSE, dySE, lenSE,
@@ -2757,6 +2781,8 @@ class GameScene extends Phaser.Scene {
             vCruise2: vCruise * vCruise,
             masses,
             earthRadius: 80 * 5,        // matches createEarth
+            earthMu,
+            angularAccel,
             dt, maxSteps, maxTime,
             thrustForce,
             fuelBurnRate: thrustForce / exhaustVel,
@@ -2787,6 +2813,20 @@ class GameScene extends Phaser.Scene {
             dt, maxSteps, maxTime,
             thrustForce, fuelBurnRate, initialFuel, dryMass
         } = ctx;
+        // Earth-gravity mu and autopilot angularAccel are optional for
+        // backward compat; default the earthMu to 0 (old behaviour) and
+        // angularAccel to 3.0 if the ctx wasn't built by
+        // _buildTrajectorySimContext (e.g. the compare-test straight-line
+        // ctx). New builders always populate them.
+        const earthMu = (typeof ctx.earthMu === 'number') ? ctx.earthMu : 0;
+        const angularAccel = (typeof ctx.angularAccel === 'number' && ctx.angularAccel > 0)
+            ? ctx.angularAccel : 3.0;
+        // ORIENT-phase delay: live autopilot must rotate to the requested
+        // heading before firing the main engine. The bang-bang schedule
+        // takes tOrient = 2 * sqrt(|angleOffset| / angularAccel) seconds
+        // (see AutopilotController's ORIENT case). During this window the
+        // ship coasts under gravity only; boosting is inhibited.
+        const tOrient = 2 * Math.sqrt(Math.abs(angleOffset) / Math.max(angularAccel, 1e-3));
 
         // Initial ship state defaults to rest-at-S but callers can override
         // via ctx.initShip = { x, y, vx, vy } to plan from an arbitrary
@@ -2805,7 +2845,9 @@ class GameScene extends Phaser.Scene {
         // If the initial velocity is already at or past cruise, skip BOOST
         // entirely and go straight to ballistic coast -- avoids over-burning
         // fuel when the sim is invoked as a replanning refinement on a ship
-        // that's already at speed.
+        // that's already at speed. Note: `boosting` here just gates the
+        // future eligibility; the ORIENT-phase check below (t < tOrient)
+        // separately inhibits thrust even when boosting=true.
         let boosting = (vx * vx + vy * vy) < vCruise2;
 
         const N = masses.length;
@@ -2847,7 +2889,11 @@ class GameScene extends Phaser.Scene {
             let ay = 0;
             let killed = false;
 
-            if (boosting) {
+            // BOOST is inhibited during the ORIENT window (t < tOrient) --
+            // live autopilot spends this time rotating the ship, not firing
+            // the main engine. After tOrient the standard boosting rule
+            // (thrust until speed >= vCruise or fuel runs out) applies.
+            if (boosting && t >= tOrient) {
                 const mass = dryMass + fuel;
                 const Fx = dirX * thrustForce;
                 const Fy = dirY * thrustForce;
@@ -2877,6 +2923,24 @@ class GameScene extends Phaser.Scene {
                 }
                 if (masses[i].killR > 0 && r <= masses[i].killR) {
                     killed = true;
+                }
+            }
+
+            // Earth's gravitational pull on the ship. Live physics
+            // (applyGravity) includes this every frame; the sim used to
+            // ignore it, biasing ballistic-coast time and final-approach
+            // deflection. earthMu = 0 for legacy ctx builders (e.g. the
+            // compare-test straight-line ctx) leaves the old behaviour
+            // intact.
+            if (earthMu > 0) {
+                const dxE = Ex - x;
+                const dyE = Ey - y;
+                const r2E = dxE * dxE + dyE * dyE;
+                const rE = Math.sqrt(r2E);
+                if (rE > 1) {
+                    const gE = earthMu / r2E;
+                    ax += (dxE / rE) * gE;
+                    ay += (dyE / rE) * gE;
                 }
             }
             if (killed) {
@@ -3152,6 +3216,15 @@ class GameScene extends Phaser.Scene {
             useLiveShipState: true
         });
         if (!ctx) return;
+        // Wall time (ms) that simCtx.masses currently represents. Set to
+        // the estimated hand-off wall time at sweep-start. If the sweep
+        // overshoots this projection (i.e., planning takes longer than
+        // estimated), updateSlingshotSweep will incrementally advance
+        // simCtx.masses forward in-place so every candidate is always
+        // scored against a not-yet-past star projection instead of a
+        // stale pre-roll snapshot.
+        this._simCtxProjectedWallMs = this._sweepStartWallMs
+            + this._lastPlanTimeEstimateSec * 1000;
         const {
             Sx, Sy, Ex, Ey,
             dxSE, dySE, lenSE,
@@ -3401,6 +3474,51 @@ class GameScene extends Phaser.Scene {
             thrustForce, fuelBurnRate, initialFuel, dryMass,
             initShip: { x: Sx, y: Sy, vx: 0, vy: 0 }
         };
+
+        // Adaptive pre-roll correction: if the sweep has overshot the
+        // T_plan_est projection captured at sweep-start, advance
+        // simCtx.masses in-place so candidates evaluated this frame are
+        // scored against a projection that hasn't already been passed by
+        // the real world. Without this, an underestimated T_plan_est
+        // leaves every candidate scored against a stale pre-roll, and
+        // the plan installed at hand-off systematically diverges from
+        // the real trajectory.
+        //
+        // We advance from the previously projected wall time to "now"
+        // rather than to the true (unknown) hand-off wall time, then
+        // re-anchor _simCtxProjectedWallMs to now. Effectively simCtx
+        // asymptotes to live star state when planning drags on. The
+        // hand-off mini-sweep does the final live-state refinement.
+        if (simCtx.masses && this._simCtxProjectedWallMs != null) {
+            const nowMs = (typeof performance !== 'undefined' && performance.now)
+                ? performance.now()
+                : Date.now();
+            if (nowMs > this._simCtxProjectedWallMs) {
+                const advanceSec = (nowMs - this._simCtxProjectedWallMs) / 1000;
+                if (advanceSec > 0) {
+                    const N = simCtx.masses.length;
+                    const sX = new Array(N), sY = new Array(N);
+                    const sVX = new Array(N), sVY = new Array(N);
+                    for (let i = 0; i < N; i++) {
+                        sX[i] = simCtx.masses[i].x0;
+                        sY[i] = simCtx.masses[i].y0;
+                        sVX[i] = simCtx.masses[i].vx;
+                        sVY[i] = simCtx.masses[i].vy;
+                    }
+                    this._preRollStarsInPlace(
+                        simCtx.masses, sX, sY, sVX, sVY, advanceSec, dt
+                    );
+                    for (let i = 0; i < N; i++) {
+                        simCtx.masses[i].x0 = sX[i];
+                        simCtx.masses[i].y0 = sY[i];
+                        simCtx.masses[i].vx = sVX[i];
+                        simCtx.masses[i].vy = sVY[i];
+                    }
+                    this._simCtxProjectedWallMs = nowMs;
+                }
+            }
+        }
+
         const simulateForAngle = (angleOffset) =>
             this._simulateShipTrajectoryNBody(angleOffset, simCtx);
 
@@ -3701,15 +3819,37 @@ class GameScene extends Phaser.Scene {
             // local mini-sweep around it against the live ctx and pick
             // whichever angle actually gets closest to Earth. Cost is
             // ~2*windowSteps live sims (typically <1 ms total).
+            // Estimate how long this mini-sweep will take from the rolling
+            // buffer of past durations (default 50 ms). Pre-roll liveCtx by
+            // that amount so its t=0 star state represents the world as it
+            // will exist when the mini-sweep completes and the plan is
+            // installed -- not the state at the moment we snapshot. Without
+            // this, stars drift ~50 ms during the mini-sweep and the
+            // installed plan's t=0 is already stale by BOOST ignition.
+            let miniSweepEstSec = DEFAULT_MINISWEEP_TIME_ESTIMATE_SEC;
+            if (RECENT_MINISWEEP_TIMES_SEC.length > 0) {
+                let s = 0;
+                for (const t of RECENT_MINISWEEP_TIMES_SEC) s += t;
+                miniSweepEstSec = s / RECENT_MINISWEEP_TIMES_SEC.length;
+            }
+            const miniSweepStartMs = (typeof performance !== 'undefined' && performance.now)
+                ? performance.now()
+                : Date.now();
             const liveCtx = this._buildTrajectorySimContext({
-                preRollSec: 0,
+                preRollSec: miniSweepEstSec,
                 useLiveShipState: true
             });
             let liveBest = null;      // best live result
             let liveBestAngle = bestAngle;
             if (liveCtx) {
                 const dAngleRad = Phaser.Math.DegToRad(0.025);
-                const windowSteps = 30;   // +/- 0.75 deg local window
+                // +/- 3 deg local window. Was +/- 0.75 deg but that's too
+                // narrow to rescue plans when pre-roll misprediction moves
+                // the true live-optimal angle by more than a degree from
+                // the pre-rolled winner (common when T_plan_est is off).
+                // 3 deg covers realistic misprediction envelopes at the
+                // cost of ~240 live sims (~30 ms) at hand-off.
+                const windowSteps = 120;
                 // Same 5%-margin star-clip filter used by the coarse and
                 // fine sweeps. Without it the mini-sweep could pick a
                 // live-refit trajectory that clips a star simply because
@@ -3737,6 +3877,20 @@ class GameScene extends Phaser.Scene {
                         || liveBest.distToEarth < bestResult.distToEarth) {
                         bestResult = liveBest;
                         bestAngle = liveBestAngle;
+                    }
+                }
+            }
+            // Record the mini-sweep's actual wall-time so the next hand-off
+            // can pre-roll its liveCtx more accurately.
+            {
+                const miniSweepEndMs = (typeof performance !== 'undefined' && performance.now)
+                    ? performance.now()
+                    : Date.now();
+                const miniSweepActualSec = (miniSweepEndMs - miniSweepStartMs) / 1000;
+                if (miniSweepActualSec >= 0 && Number.isFinite(miniSweepActualSec)) {
+                    RECENT_MINISWEEP_TIMES_SEC.push(miniSweepActualSec);
+                    while (RECENT_MINISWEEP_TIMES_SEC.length > RECENT_MINISWEEP_TIMES_MAX) {
+                        RECENT_MINISWEEP_TIMES_SEC.shift();
                     }
                 }
             }
